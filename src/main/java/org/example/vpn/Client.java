@@ -20,6 +20,7 @@ public class Client {
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
+    private static final String SERVER_TUN_IP = "10.0.0.1";
     private static final String CLIENT_MASK = "255.255.255.0";
 
     @EventListener(ApplicationReadyEvent.class)
@@ -226,7 +227,7 @@ public class Client {
                         packet
                 );
 
-                if (!isIpv4(data)) {
+                if (!isIpv4(data) || !hasDestination(data, SERVER_TUN_IP)) {
                     continue;
                 }
 
@@ -254,6 +255,10 @@ public class Client {
 
     private boolean isIpv4(byte[] data) {
         return data.length >= 20 && (data[0] & 0xF0) == 0x40;
+    }
+
+    private boolean hasDestination(byte[] data, String ip) {
+        return isIpv4(data) && ip.equals(ip(data, 16));
     }
 
     private String ipInfo(byte[] data) {
