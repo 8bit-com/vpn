@@ -2,6 +2,7 @@ package org.example.vpn;
 
 import com.sun.jna.Pointer;
 import com.sun.jna.WString;
+import com.sun.jna.ptr.IntByReference;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,8 @@ public class Client {
         DatagramSocket socket = new DatagramSocket();
 
         register(socket);
+
+        startWintunToUdp(socket, session);
 
         receiveUdpAndWriteToWintun(socket, session);
     }
@@ -168,6 +171,75 @@ public class Client {
                 session,
                 packet
         );
+    }
+
+    private void startWintunToUdp(
+            DatagramSocket socket,
+            Pointer session
+    ) {
+
+        Thread thread =
+                new Thread(
+                        () -> readWintunAndSendUdp(socket, session),
+                        "wintun-to-udp"
+                );
+
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void readWintunAndSendUdp(
+            DatagramSocket socket,
+            Pointer session
+    ) {
+
+        while (true) {
+
+            try {
+
+                IntByReference size = new IntByReference();
+
+                Pointer packet =
+                        Wintun.INSTANCE.WintunReceivePacket(
+                                session,
+                                size
+                        );
+
+                if (packet == null) {
+                    Thread.sleep(1);
+                    continue;
+                }
+
+                byte[] data =
+                        packet.getByteArray(
+                                0,
+                                size.getValue()
+                        );
+
+                Wintun.INSTANCE.WintunReleaseReceivePacket(
+                        session,
+                        packet
+                );
+
+                socket.send(
+                        new DatagramPacket(
+                                data,
+                                data.length,
+                                InetAddress.getByName(SERVER_HOST),
+                                SERVER_PORT
+                        )
+                );
+
+                System.out.println(
+                        "WINTUN -> UDP : " +
+                                data.length +
+                                " bytes"
+                );
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     private void runCommand(String... command) throws Exception {
