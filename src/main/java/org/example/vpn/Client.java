@@ -26,7 +26,7 @@ public class Client {
     private static final int MTU = 1400;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
-    private static final String CLIENT_MASK = "255.255.255.0";
+    private static final String CLIENT_MASK = "255.255.255.255";
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToUdpCounter = new AtomicLong();
@@ -73,22 +73,13 @@ public class Client {
 
     private Pointer startWintun() {
 
-        Pointer adapter =
-                Wintun.INSTANCE.WintunCreateAdapter(
-                        new WString(ADAPTER_NAME),
-                        new WString("VPN"),
-                        null
-                );
+        Pointer adapter = Wintun.INSTANCE.WintunCreateAdapter(new WString(ADAPTER_NAME), new WString("VPN"), null);
 
         if (adapter == null) {
             throw new RuntimeException("WintunCreateAdapter failed");
         }
 
-        Pointer session =
-                Wintun.INSTANCE.WintunStartSession(
-                        adapter,
-                        WINTUN_RING_SIZE
-                );
+        Pointer session = Wintun.INSTANCE.WintunStartSession(adapter, WINTUN_RING_SIZE);
 
         if (session == null) {
             throw new RuntimeException("WintunStartSession failed");
@@ -103,6 +94,8 @@ public class Client {
 
         runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
         runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
+        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
+        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
         runCommandIgnoreError("route", "delete", SERVER_HOST);
 
         runCommandIgnoreError(
@@ -132,7 +125,7 @@ public class Client {
                 CLIENT_MASK
         );
 
-        System.out.println("MYVPN IP CONFIGURED");
+        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/32");
     }
 
     private void configureMtu() throws Exception {
@@ -153,57 +146,22 @@ public class Client {
 
     private void configureRoutes(String defaultGateway, String myVpnInterfaceIndex) throws Exception {
 
-        runCommand(
-                "route",
-                "add",
-                SERVER_HOST,
-                "mask",
-                "255.255.255.255",
-                defaultGateway,
-                "metric",
-                "1"
-        );
+        runCommand("route", "add", SERVER_HOST, "mask", "255.255.255.255", defaultGateway, "metric", "1");
 
-        runCommand(
-                "route",
-                "add",
-                "0.0.0.0",
-                "mask",
-                "128.0.0.0",
-                "0.0.0.0",
-                "metric",
-                "1",
-                "if",
-                myVpnInterfaceIndex
-        );
-
-        runCommand(
-                "route",
-                "add",
-                "128.0.0.0",
-                "mask",
-                "128.0.0.0",
-                "0.0.0.0",
-                "metric",
-                "1",
-                "if",
-                myVpnInterfaceIndex
-        );
+        runCommand("route", "add", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
+        runCommand("route", "add", "128.0.0.0", "mask", "128.0.0.0", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
 
         System.out.println("MYVPN FULL TUNNEL ROUTES CONFIGURED");
     }
 
     private String getDefaultGateway() throws Exception {
 
-        Process process =
-                new ProcessBuilder(
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne '" + ADAPTER_NAME + "' } | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).NextHop"
-                )
-                        .redirectErrorStream(true)
-                        .start();
+        Process process = new ProcessBuilder(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne '" + ADAPTER_NAME + "' } | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).NextHop"
+        ).redirectErrorStream(true).start();
 
         String gateway;
 
@@ -222,15 +180,12 @@ public class Client {
 
     private String getMyVpnInterfaceIndex() throws Exception {
 
-        Process process =
-                new ProcessBuilder(
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
-                )
-                        .redirectErrorStream(true)
-                        .start();
+        Process process = new ProcessBuilder(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
+        ).redirectErrorStream(true).start();
 
         String interfaceIndex;
 
@@ -251,38 +206,20 @@ public class Client {
 
         byte[] data = "HELLO".getBytes();
 
-        socket.send(
-                new DatagramPacket(
-                        data,
-                        data.length,
-                        InetAddress.getByName(SERVER_HOST),
-                        SERVER_PORT
-                )
-        );
+        socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
 
         System.out.println("REGISTERED");
     }
 
-    private void receiveUdpAndWriteToWintun(
-            DatagramSocket socket,
-            Pointer session
-    ) throws Exception {
+    private void receiveUdpAndWriteToWintun(DatagramSocket socket, Pointer session) throws Exception {
 
         while (true) {
 
-            DatagramPacket udpPacket =
-                    new DatagramPacket(
-                            new byte[65535],
-                            65535
-                    );
+            DatagramPacket udpPacket = new DatagramPacket(new byte[65535], 65535);
 
             socket.receive(udpPacket);
 
-            byte[] data =
-                    Arrays.copyOf(
-                            udpPacket.getData(),
-                            udpPacket.getLength()
-                    );
+            byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
 
             if (!isIpv4(data)) {
                 continue;
@@ -290,61 +227,32 @@ public class Client {
 
             writeToWintun(session, data);
 
-            logEvery(
-                    udpToWintunCounter,
-                    "UDP -> WINTUN",
-                    data
-            );
+            logEvery(udpToWintunCounter, "UDP -> WINTUN", data);
         }
     }
 
-    private void writeToWintun(
-            Pointer session,
-            byte[] data
-    ) {
+    private void writeToWintun(Pointer session, byte[] data) {
 
-        Pointer packet =
-                Wintun.INSTANCE.WintunAllocateSendPacket(
-                        session,
-                        data.length
-                );
+        Pointer packet = Wintun.INSTANCE.WintunAllocateSendPacket(session, data.length);
 
         if (packet == null) {
             throw new RuntimeException("WintunAllocateSendPacket failed");
         }
 
-        packet.write(
-                0,
-                data,
-                0,
-                data.length
-        );
+        packet.write(0, data, 0, data.length);
 
-        Wintun.INSTANCE.WintunSendPacket(
-                session,
-                packet
-        );
+        Wintun.INSTANCE.WintunSendPacket(session, packet);
     }
 
-    private void startWintunToUdp(
-            DatagramSocket socket,
-            Pointer session
-    ) {
+    private void startWintunToUdp(DatagramSocket socket, Pointer session) {
 
-        Thread thread =
-                new Thread(
-                        () -> readWintunAndSendUdp(socket, session),
-                        "wintun-to-udp"
-                );
+        Thread thread = new Thread(() -> readWintunAndSendUdp(socket, session), "wintun-to-udp");
 
         thread.setDaemon(true);
         thread.start();
     }
 
-    private void readWintunAndSendUdp(
-            DatagramSocket socket,
-            Pointer session
-    ) {
+    private void readWintunAndSendUdp(DatagramSocket socket, Pointer session) {
 
         while (true) {
 
@@ -352,46 +260,24 @@ public class Client {
 
                 IntByReference size = new IntByReference();
 
-                Pointer packet =
-                        Wintun.INSTANCE.WintunReceivePacket(
-                                session,
-                                size
-                        );
+                Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, size);
 
                 if (packet == null) {
                     Thread.sleep(1);
                     continue;
                 }
 
-                byte[] data =
-                        packet.getByteArray(
-                                0,
-                                size.getValue()
-                        );
+                byte[] data = packet.getByteArray(0, size.getValue());
 
-                Wintun.INSTANCE.WintunReleaseReceivePacket(
-                        session,
-                        packet
-                );
+                Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
 
                 if (!isIpv4(data)) {
                     continue;
                 }
 
-                socket.send(
-                        new DatagramPacket(
-                                data,
-                                data.length,
-                                InetAddress.getByName(SERVER_HOST),
-                                SERVER_PORT
-                        )
-                );
+                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
 
-                logEvery(
-                        wintunToUdpCounter,
-                        "WINTUN -> UDP",
-                        data
-                );
+                logEvery(wintunToUdpCounter, "WINTUN -> UDP", data);
 
             } catch (Exception e) {
                 e.printStackTrace();
@@ -399,11 +285,7 @@ public class Client {
         }
     }
 
-    private void logEvery(
-            AtomicLong counter,
-            String direction,
-            byte[] data
-    ) {
+    private void logEvery(AtomicLong counter, String direction, byte[] data) {
 
         long value = counter.incrementAndGet();
 
@@ -411,13 +293,7 @@ public class Client {
             return;
         }
 
-        System.out.println(
-                direction +
-                        " packets=" + value +
-                        " last=" + data.length +
-                        " bytes " +
-                        ipInfo(data)
-        );
+        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + ipInfo(data));
     }
 
     private boolean isIpv4(byte[] data) {
@@ -442,28 +318,19 @@ public class Client {
 
     private void runCommand(String... command) throws Exception {
 
-        Process process =
-                new ProcessBuilder(command)
-                        .redirectErrorStream(true)
-                        .start();
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         int code = process.waitFor();
 
         if (code != 0) {
-            throw new RuntimeException(
-                    "Command failed, code=" + code + ", command=" + String.join(" ", command)
-            );
+            throw new RuntimeException("Command failed, code=" + code + ", command=" + String.join(" ", command));
         }
     }
 
     private void runCommandIgnoreError(String... command) {
 
         try {
-            Process process =
-                    new ProcessBuilder(command)
-                            .redirectErrorStream(true)
-                            .start();
-
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
         } catch (Exception ignored) {
         }
