@@ -7,7 +7,7 @@ import org.springframework.stereotype.Service;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
-import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 @Service
 public class Client {
@@ -19,41 +19,43 @@ public class Client {
 
         DatagramSocket socket = new DatagramSocket();
 
-        String message = "PING";
-
-        byte[] data =
-                message.getBytes(StandardCharsets.UTF_8);
-
-        DatagramPacket request =
+        socket.send(
                 new DatagramPacket(
-                        data,
-                        data.length,
+                        "HELLO".getBytes(),
+                        5,
                         InetAddress.getByName(HOST),
                         PORT
-                );
+                )
+        );
 
-        socket.send(request);
+        System.out.println("REGISTERED");
 
-        System.out.println("PING SENT");
+        while (true) {
 
-        DatagramPacket response =
-                new DatagramPacket(
-                        new byte[65535],
-                        65535
-                );
+            DatagramPacket packet =
+                    new DatagramPacket(
+                            new byte[65535],
+                            65535
+                    );
 
-        socket.receive(response);
+            socket.receive(packet);
 
-        String text =
-                new String(
-                        response.getData(),
-                        0,
-                        response.getLength(),
-                        StandardCharsets.UTF_8
-                );
+            System.out.println(
+                    "SERVER -> CLIENT : " +
+                            packet.getLength() +
+                            " bytes"
+            );
 
-        System.out.println("RESPONSE = " + text);
+            byte[] data = Arrays.copyOf(
+                    packet.getData(),
+                    packet.getLength()
+            );
 
-        socket.close();
+            for (int i = 0; i < Math.min(32, data.length); i++) {
+                System.out.printf("%02X ", data[i]);
+            }
+
+            System.out.println();
+        }
     }
 }
