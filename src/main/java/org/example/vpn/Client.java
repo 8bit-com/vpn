@@ -135,12 +135,17 @@ public class Client {
                             udpPacket.getLength()
                     );
 
+            if (!isIpv4(data)) {
+                continue;
+            }
+
             writeToWintun(session, data);
 
             System.out.println(
                     "UDP -> WINTUN : " +
                             data.length +
-                            " bytes"
+                            " bytes " +
+                            ipInfo(data)
             );
         }
     }
@@ -221,6 +226,10 @@ public class Client {
                         packet
                 );
 
+                if (!isIpv4(data)) {
+                    continue;
+                }
+
                 socket.send(
                         new DatagramPacket(
                                 data,
@@ -233,13 +242,34 @@ public class Client {
                 System.out.println(
                         "WINTUN -> UDP : " +
                                 data.length +
-                                " bytes"
+                                " bytes " +
+                                ipInfo(data)
                 );
 
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
+    }
+
+    private boolean isIpv4(byte[] data) {
+        return data.length >= 20 && (data[0] & 0xF0) == 0x40;
+    }
+
+    private String ipInfo(byte[] data) {
+
+        if (!isIpv4(data)) {
+            return "";
+        }
+
+        return ip(data, 12) + " -> " + ip(data, 16);
+    }
+
+    private String ip(byte[] data, int offset) {
+        return (data[offset] & 0xFF) + "." +
+                (data[offset + 1] & 0xFF) + "." +
+                (data[offset + 2] & 0xFF) + "." +
+                (data[offset + 3] & 0xFF);
     }
 
     private void runCommand(String... command) throws Exception {
