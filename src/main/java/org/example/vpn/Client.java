@@ -11,6 +11,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class Client {
@@ -18,10 +19,15 @@ public class Client {
     private static final String SERVER_HOST = "80.240.23.72";
     private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
+    private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int LOG_EVERY_PACKETS = 100;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String SERVER_TUN_IP = "10.0.0.1";
     private static final String CLIENT_MASK = "255.255.255.0";
+
+    private final AtomicLong udpToWintunCounter = new AtomicLong();
+    private final AtomicLong wintunToUdpCounter = new AtomicLong();
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
@@ -33,13 +39,25 @@ public class Client {
         configureMyVpnIp();
         configureRoutes();
 
-        DatagramSocket socket = new DatagramSocket();
+        DatagramSocket socket = createUdpSocket();
 
         register(socket);
 
         startWintunToUdp(socket, session);
 
         receiveUdpAndWriteToWintun(socket, session);
+    }
+
+    private DatagramSocket createUdpSocket() throws Exception {
+
+        DatagramSocket socket = new DatagramSocket();
+
+        socket.setReceiveBufferSize(UDP_BUFFER_SIZE);
+        socket.setSendBufferSize(UDP_BUFFER_SIZE);
+
+        System.out.println("UDP SOCKET READY");
+
+        return socket;
     }
 
     private Pointer startWintun() {
@@ -225,11 +243,10 @@ public class Client {
 
             writeToWintun(session, data);
 
-            System.out.println(
-                    "UDP -> WINTUN : " +
-                            data.length +
-                            " bytes " +
-                            ipInfo(data)
+            logEvery(
+                    udpToWintunCounter,
+                    "UDP -> WINTUN",
+                    data
             );
         }
     }
@@ -323,17 +340,37 @@ public class Client {
                         )
                 );
 
-                System.out.println(
-                        "WINTUN -> UDP : " +
-                                data.length +
-                                " bytes " +
-                                ipInfo(data)
+                logEvery(
+                        wintunToUdpCounter,
+                        "WINTUN -> UDP",
+                        data
                 );
 
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
+    }
+
+    private void logEvery(
+            AtomicLong counter,
+            String direction,
+            byte[] data
+    ) {
+
+        long value = counter.incrementAndGet();
+
+        if (value % LOG_EVERY_PACKETS != 0) {
+            return;
+        }
+
+        System.out.println(
+                direction +
+                        " packets=" + value +
+                        " last=" + data.length +
+                        " bytes " +
+                        ipInfo(data)
+        );
     }
 
     private boolean isIpv4(byte[] data) {
