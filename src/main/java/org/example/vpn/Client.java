@@ -17,9 +17,14 @@ public class Client {
     private static final String SERVER_HOST = "80.240.23.72";
     private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
+    private static final String ADAPTER_NAME = "MyVPN";
+    private static final String CLIENT_IP = "10.0.0.123";
+    private static final String CLIENT_MASK = "255.255.255.0";
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
+
+        cleanupOldAdapterConfig();
 
         Pointer session = startWintun();
 
@@ -36,7 +41,7 @@ public class Client {
 
         Pointer adapter =
                 Wintun.INSTANCE.WintunCreateAdapter(
-                        new WString("MyVPN"),
+                        new WString(ADAPTER_NAME),
                         new WString("VPN"),
                         null
                 );
@@ -60,6 +65,19 @@ public class Client {
         return session;
     }
 
+    private void cleanupOldAdapterConfig() {
+
+        runCommandIgnoreError(
+                "netsh",
+                "interface",
+                "ip",
+                "delete",
+                "address",
+                "name=" + ADAPTER_NAME,
+                "addr=" + CLIENT_IP
+        );
+    }
+
     private void configureMyVpnIp() throws Exception {
 
         runCommand(
@@ -68,10 +86,10 @@ public class Client {
                 "ip",
                 "set",
                 "address",
-                "name=MyVPN",
+                "name=" + ADAPTER_NAME,
                 "static",
-                "10.0.0.123",
-                "255.255.255.0"
+                CLIENT_IP,
+                CLIENT_MASK
         );
 
         System.out.println("MYVPN IP CONFIGURED");
@@ -165,6 +183,19 @@ public class Client {
             throw new RuntimeException(
                     "Command failed, code=" + code + ", command=" + String.join(" ", command)
             );
+        }
+    }
+
+    private void runCommandIgnoreError(String... command) {
+
+        try {
+            Process process =
+                    new ProcessBuilder(command)
+                            .redirectErrorStream(true)
+                            .start();
+
+            process.waitFor();
+        } catch (Exception ignored) {
         }
     }
 }
