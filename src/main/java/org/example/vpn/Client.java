@@ -31,6 +31,7 @@ public class Client {
         Pointer session = startWintun();
 
         configureMyVpnIp();
+        configureRoutes();
 
         DatagramSocket socket = new DatagramSocket();
 
@@ -80,6 +81,24 @@ public class Client {
                 "name=" + ADAPTER_NAME,
                 "addr=" + CLIENT_IP
         );
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                "0.0.0.0",
+                "mask",
+                "128.0.0.0",
+                CLIENT_IP
+        );
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                "128.0.0.0",
+                "mask",
+                "128.0.0.0",
+                CLIENT_IP
+        );
     }
 
     private void configureMyVpnIp() throws Exception {
@@ -97,6 +116,70 @@ public class Client {
         );
 
         System.out.println("MYVPN IP CONFIGURED");
+    }
+
+    private void configureRoutes() throws Exception {
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                SERVER_HOST
+        );
+
+        runCommand(
+                "route",
+                "add",
+                SERVER_HOST,
+                "mask",
+                "255.255.255.255",
+                getDefaultGateway(),
+                "metric",
+                "1"
+        );
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                "0.0.0.0",
+                "mask",
+                "128.0.0.0"
+        );
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                "128.0.0.0",
+                "mask",
+                "128.0.0.0"
+        );
+
+        runCommand(
+                "route",
+                "add",
+                "0.0.0.0",
+                "mask",
+                "128.0.0.0",
+                CLIENT_IP,
+                "metric",
+                "1"
+        );
+
+        runCommand(
+                "route",
+                "add",
+                "128.0.0.0",
+                "mask",
+                "128.0.0.0",
+                CLIENT_IP,
+                "metric",
+                "1"
+        );
+
+        System.out.println("MYVPN ROUTES CONFIGURED");
+    }
+
+    private String getDefaultGateway() {
+        return "192.168.1.1";
     }
 
     private void register(DatagramSocket socket) throws Exception {
@@ -227,7 +310,7 @@ public class Client {
                         packet
                 );
 
-                if (!isIpv4(data) || !hasDestination(data, SERVER_TUN_IP)) {
+                if (!isIpv4(data)) {
                     continue;
                 }
 
@@ -255,10 +338,6 @@ public class Client {
 
     private boolean isIpv4(byte[] data) {
         return data.length >= 20 && (data[0] & 0xF0) == 0x40;
-    }
-
-    private boolean hasDestination(byte[] data, String ip) {
-        return isIpv4(data) && ip.equals(ip(data, 16));
     }
 
     private String ipInfo(byte[] data) {
