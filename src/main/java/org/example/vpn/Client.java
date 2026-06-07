@@ -44,7 +44,11 @@ public class Client {
 
         configureMyVpnIp();
         configureMtu();
-        configureRoutes(defaultGateway);
+
+        String myVpnInterfaceIndex = getMyVpnInterfaceIndex();
+        System.out.println("MYVPN INTERFACE INDEX: " + myVpnInterfaceIndex);
+
+        configureRoutes(defaultGateway, myVpnInterfaceIndex);
 
         DatagramSocket socket = createUdpSocket();
 
@@ -147,7 +151,7 @@ public class Client {
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
-    private void configureRoutes(String defaultGateway) throws Exception {
+    private void configureRoutes(String defaultGateway, String myVpnInterfaceIndex) throws Exception {
 
         runCommand(
                 "route",
@@ -166,9 +170,11 @@ public class Client {
                 "0.0.0.0",
                 "mask",
                 "128.0.0.0",
-                CLIENT_IP,
+                "0.0.0.0",
                 "metric",
-                "1"
+                "1",
+                "if",
+                myVpnInterfaceIndex
         );
 
         runCommand(
@@ -177,9 +183,11 @@ public class Client {
                 "128.0.0.0",
                 "mask",
                 "128.0.0.0",
-                CLIENT_IP,
+                "0.0.0.0",
                 "metric",
-                "1"
+                "1",
+                "if",
+                myVpnInterfaceIndex
         );
 
         System.out.println("MYVPN FULL TUNNEL ROUTES CONFIGURED");
@@ -210,6 +218,33 @@ public class Client {
         }
 
         return gateway.trim();
+    }
+
+    private String getMyVpnInterfaceIndex() throws Exception {
+
+        Process process =
+                new ProcessBuilder(
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
+                )
+                        .redirectErrorStream(true)
+                        .start();
+
+        String interfaceIndex;
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            interfaceIndex = reader.readLine();
+        }
+
+        int code = process.waitFor();
+
+        if (code != 0 || interfaceIndex == null || interfaceIndex.trim().isEmpty()) {
+            throw new RuntimeException("Cannot detect MyVPN interface index");
+        }
+
+        return interfaceIndex.trim();
     }
 
     private void register(DatagramSocket socket) throws Exception {
