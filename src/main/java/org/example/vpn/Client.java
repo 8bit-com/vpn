@@ -28,6 +28,7 @@ public class Client {
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String SERVER_TUN_IP = "10.0.0.1";
     private static final String CLIENT_MASK = "255.255.255.0";
+    private static final String TEST_IP = "8.8.8.8";
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToUdpCounter = new AtomicLong();
@@ -107,29 +108,10 @@ public class Client {
                 "addr=" + CLIENT_IP
         );
 
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                "0.0.0.0",
-                "mask",
-                "128.0.0.0",
-                CLIENT_IP
-        );
-
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                "128.0.0.0",
-                "mask",
-                "128.0.0.0",
-                CLIENT_IP
-        );
-
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                SERVER_HOST
-        );
+        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
+        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
+        runCommandIgnoreError("route", "delete", TEST_IP);
+        runCommandIgnoreError("route", "delete", SERVER_HOST);
     }
 
     private void configureMyVpnIp() throws Exception {
@@ -178,45 +160,18 @@ public class Client {
                 "1"
         );
 
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                "0.0.0.0",
-                "mask",
-                "128.0.0.0"
-        );
-
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                "128.0.0.0",
-                "mask",
-                "128.0.0.0"
-        );
-
         runCommand(
                 "route",
                 "add",
-                "0.0.0.0",
+                TEST_IP,
                 "mask",
-                "128.0.0.0",
+                "255.255.255.255",
                 CLIENT_IP,
                 "metric",
                 "1"
         );
 
-        runCommand(
-                "route",
-                "add",
-                "128.0.0.0",
-                "mask",
-                "128.0.0.0",
-                CLIENT_IP,
-                "metric",
-                "1"
-        );
-
-        System.out.println("MYVPN ROUTES CONFIGURED");
+        System.out.println("MYVPN ROUTES CONFIGURED: only " + TEST_IP);
     }
 
     private String getDefaultGateway() throws Exception {
