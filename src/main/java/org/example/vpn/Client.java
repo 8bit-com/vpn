@@ -22,7 +22,7 @@ public class Client {
     private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
-    private static final int LOG_EVERY_PACKETS = 50;
+    private static final int LOG_EVERY_PACKETS = 1;
     private static final int MTU = 1200;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
@@ -313,20 +313,11 @@ public class Client {
             return;
         }
 
-        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + ipInfo(data));
+        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
     }
 
     private boolean isIpv4(byte[] data) {
         return data.length >= 20 && (data[0] & 0xF0) == 0x40;
-    }
-
-    private String ipInfo(byte[] data) {
-
-        if (!isIpv4(data)) {
-            return "";
-        }
-
-        return ip(data, 12) + " -> " + ip(data, 16);
     }
 
     private String ip(byte[] data, int offset) {
