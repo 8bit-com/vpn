@@ -93,6 +93,9 @@ public class Client {
 
     private void cleanupOldAdapterConfig() {
 
+        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "0.0.0.0", SERVER_TUN_IP);
+        runCommandIgnoreError("route", "-p", "delete", "0.0.0.0", "mask", "0.0.0.0", SERVER_TUN_IP);
+
         runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
         runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
         runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
@@ -109,9 +112,9 @@ public class Client {
 
     private void configureMyVpnIp() throws Exception {
 
-        runCommand("netsh", "interface", "ip", "set", "address", "name=" + ADAPTER_NAME, "static", CLIENT_IP, CLIENT_MASK, SERVER_TUN_IP);
+        runCommand("netsh", "interface", "ip", "set", "address", "name=" + ADAPTER_NAME, "static", CLIENT_IP, CLIENT_MASK);
 
-        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/24 gateway " + SERVER_TUN_IP);
+        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/24 without gateway");
     }
 
     private void configureMtu() throws Exception {
