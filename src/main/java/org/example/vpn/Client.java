@@ -2,7 +2,6 @@ package org.example.vpn;
 
 import com.sun.jna.Pointer;
 import com.sun.jna.WString;
-import com.sun.jna.ptr.IntByReference;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
@@ -15,31 +14,25 @@ import java.util.Arrays;
 @Service
 public class Client {
 
-    private static final String HOST = "80.240.23.72";
-    private static final int PORT = 51888;
+    private static final String SERVER_HOST = "80.240.23.72";
+    private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
 
-        DatagramSocket socket = new DatagramSocket();
+        Pointer session = startWintun();
 
-        Pointer session = createSession();
+        configureMyVpnIp();
+
+        DatagramSocket socket = new DatagramSocket();
 
         register(socket);
 
-        startWintunReader(
-                socket,
-                session
-        );
-
-        receiveLoop(
-                socket,
-                session
-        );
+        receiveUdpAndWriteToWintun(socket, session);
     }
 
-    private Pointer createSession() {
+    private Pointer startWintun() {
 
         Pointer adapter =
                 Wintun.INSTANCE.WintunCreateAdapter(
@@ -48,7 +41,9 @@ public class Client {
                         null
                 );
 
-        System.out.println(adapter);
+        if (adapter == null) {
+            throw new RuntimeException("WintunCreateAdapter failed");
+        }
 
         Pointer session =
                 Wintun.INSTANCE.WintunStartSession(
@@ -56,28 +51,49 @@ public class Client {
                         WINTUN_RING_SIZE
                 );
 
-        System.out.println(session);
+        if (session == null) {
+            throw new RuntimeException("WintunStartSession failed");
+        }
+
+        System.out.println("WINTUN STARTED");
 
         return session;
     }
 
-    private void register(
-            DatagramSocket socket
-    ) throws Exception {
+    private void configureMyVpnIp() throws Exception {
+
+        runCommand(
+                "netsh",
+                "interface",
+                "ip",
+                "set",
+                "address",
+                "name=MyVPN",
+                "static",
+                "10.0.0.123",
+                "255.255.255.0"
+        );
+
+        System.out.println("MYVPN IP CONFIGURED");
+    }
+
+    private void register(DatagramSocket socket) throws Exception {
+
+        byte[] data = "HELLO".getBytes();
 
         socket.send(
                 new DatagramPacket(
-                        "HELLO".getBytes(),
-                        5,
-                        InetAddress.getByName(HOST),
-                        PORT
+                        data,
+                        data.length,
+                        InetAddress.getByName(SERVER_HOST),
+                        SERVER_PORT
                 )
         );
 
         System.out.println("REGISTERED");
     }
 
-    private void receiveLoop(
+    private void receiveUdpAndWriteToWintun(
             DatagramSocket socket,
             Pointer session
     ) throws Exception {
@@ -92,15 +108,13 @@ public class Client {
 
             socket.receive(udpPacket);
 
-            byte[] data = Arrays.copyOf(
-                    udpPacket.getData(),
-                    udpPacket.getLength()
-            );
+            byte[] data =
+                    Arrays.copyOf(
+                            udpPacket.getData(),
+                            udpPacket.getLength()
+                    );
 
-            writeToWintun(
-                    session,
-                    data
-            );
+            writeToWintun(session, data);
 
             System.out.println(
                     "UDP -> WINTUN : " +
@@ -115,13 +129,17 @@ public class Client {
             byte[] data
     ) {
 
-        Pointer wintunPacket =
+        Pointer packet =
                 Wintun.INSTANCE.WintunAllocateSendPacket(
                         session,
                         data.length
                 );
 
-        wintunPacket.write(
+        if (packet == null) {
+            throw new RuntimeException("WintunAllocateSendPacket failed");
+        }
+
+        packet.write(
                 0,
                 data,
                 0,
@@ -130,76 +148,23 @@ public class Client {
 
         Wintun.INSTANCE.WintunSendPacket(
                 session,
-                wintunPacket
+                packet
         );
     }
 
-    private void startWintunReader(
-            DatagramSocket socket,
-            Pointer session
-    ) {
+    private void runCommand(String... command) throws Exception {
 
-        new Thread(
-                () -> readWintun(
-                        socket,
-                        session
-                ),
-                "wintun-reader"
-        ).start();
-    }
+        Process process =
+                new ProcessBuilder(command)
+                        .redirectErrorStream(true)
+                        .start();
 
-    private void readWintun(
-            DatagramSocket socket,
-            Pointer session
-    ) {
+        int code = process.waitFor();
 
-        while (true) {
-
-            try {
-
-                IntByReference size =
-                        new IntByReference();
-
-                Pointer packet =
-                        Wintun.INSTANCE.WintunReceivePacket(
-                                session,
-                                size
-                        );
-
-                if (packet == null) {
-                    Thread.sleep(1);
-                    continue;
-                }
-
-                byte[] data =
-                        packet.getByteArray(
-                                0,
-                                size.getValue()
-                        );
-
-                Wintun.INSTANCE.WintunReleaseReceivePacket(
-                        session,
-                        packet
-                );
-
-                socket.send(
-                        new DatagramPacket(
-                                data,
-                                data.length,
-                                InetAddress.getByName(HOST),
-                                PORT
-                        )
-                );
-
-                System.out.println(
-                        "WINTUN -> UDP : " +
-                                data.length +
-                                " bytes"
-                );
-
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+        if (code != 0) {
+            throw new RuntimeException(
+                    "Command failed, code=" + code + ", command=" + String.join(" ", command)
+            );
         }
     }
 }
