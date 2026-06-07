@@ -7,6 +7,8 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -35,11 +37,14 @@ public class Client {
 
         cleanupOldAdapterConfig();
 
+        String defaultGateway = getDefaultGateway();
+        System.out.println("DEFAULT GATEWAY: " + defaultGateway);
+
         Pointer session = startWintun();
 
         configureMyVpnIp();
         configureMtu();
-        configureRoutes();
+        configureRoutes(defaultGateway);
 
         DatagramSocket socket = createUdpSocket();
 
@@ -119,6 +124,12 @@ public class Client {
                 "128.0.0.0",
                 CLIENT_IP
         );
+
+        runCommandIgnoreError(
+                "route",
+                "delete",
+                SERVER_HOST
+        );
     }
 
     private void configureMyVpnIp() throws Exception {
@@ -154,13 +165,7 @@ public class Client {
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
-    private void configureRoutes() throws Exception {
-
-        runCommandIgnoreError(
-                "route",
-                "delete",
-                SERVER_HOST
-        );
+    private void configureRoutes(String defaultGateway) throws Exception {
 
         runCommand(
                 "route",
@@ -168,7 +173,7 @@ public class Client {
                 SERVER_HOST,
                 "mask",
                 "255.255.255.255",
-                getDefaultGateway(),
+                defaultGateway,
                 "metric",
                 "1"
         );
@@ -214,8 +219,31 @@ public class Client {
         System.out.println("MYVPN ROUTES CONFIGURED");
     }
 
-    private String getDefaultGateway() {
-        return "192.168.1.1";
+    private String getDefaultGateway() throws Exception {
+
+        Process process =
+                new ProcessBuilder(
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne '" + ADAPTER_NAME + "' } | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).NextHop"
+                )
+                        .redirectErrorStream(true)
+                        .start();
+
+        String gateway;
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            gateway = reader.readLine();
+        }
+
+        int code = process.waitFor();
+
+        if (code != 0 || gateway == null || gateway.trim().isEmpty()) {
+            throw new RuntimeException("Cannot detect default gateway");
+        }
+
+        return gateway.trim();
     }
 
     private void register(DatagramSocket socket) throws Exception {
