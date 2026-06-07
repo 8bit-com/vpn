@@ -22,10 +22,11 @@ public class Client {
     private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
-    private static final int LOG_EVERY_PACKETS = 100;
-    private static final int MTU = 1400;
+    private static final int LOG_EVERY_PACKETS = 1;
+    private static final int MTU = 1280;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
+    private static final String SERVER_TUN_IP = "10.0.0.1";
     private static final String CLIENT_MASK = "255.255.255.255";
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
@@ -97,49 +98,23 @@ public class Client {
         runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
         runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
         runCommandIgnoreError("route", "delete", SERVER_HOST);
+        runCommandIgnoreError("route", "delete", SERVER_TUN_IP);
 
-        runCommandIgnoreError(
-                "netsh",
-                "interface",
-                "ip",
-                "delete",
-                "address",
-                "name=" + ADAPTER_NAME,
-                "addr=" + CLIENT_IP
-        );
+        runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
 
         System.out.println("MYVPN CLEANUP DONE");
     }
 
     private void configureMyVpnIp() throws Exception {
 
-        runCommand(
-                "netsh",
-                "interface",
-                "ip",
-                "set",
-                "address",
-                "name=" + ADAPTER_NAME,
-                "static",
-                CLIENT_IP,
-                CLIENT_MASK
-        );
+        runCommand("netsh", "interface", "ip", "set", "address", "name=" + ADAPTER_NAME, "static", CLIENT_IP, CLIENT_MASK);
 
         System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/32");
     }
 
     private void configureMtu() throws Exception {
 
-        runCommand(
-                "netsh",
-                "interface",
-                "ipv4",
-                "set",
-                "subinterface",
-                ADAPTER_NAME,
-                "mtu=" + MTU,
-                "store=active"
-        );
+        runCommand("netsh", "interface", "ipv4", "set", "subinterface", ADAPTER_NAME, "mtu=" + MTU, "store=active");
 
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
@@ -147,7 +122,7 @@ public class Client {
     private void configureRoutes(String defaultGateway, String myVpnInterfaceIndex) throws Exception {
 
         runCommand("route", "add", SERVER_HOST, "mask", "255.255.255.255", defaultGateway, "metric", "1");
-
+        runCommand("route", "add", SERVER_TUN_IP, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
         runCommand("route", "add", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
         runCommand("route", "add", "128.0.0.0", "mask", "128.0.0.0", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
 
@@ -221,7 +196,7 @@ public class Client {
 
             byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
 
-            if (!isIpv4(data)) {
+            if (!shouldAcceptFromServer(data)) {
                 continue;
             }
 
@@ -271,7 +246,7 @@ public class Client {
 
                 Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
 
-                if (!isIpv4(data)) {
+                if (!shouldSendToServer(data)) {
                     continue;
                 }
 
@@ -283,6 +258,46 @@ public class Client {
                 e.printStackTrace();
             }
         }
+    }
+
+    private boolean shouldSendToServer(byte[] data) {
+
+        if (!isIpv4(data)) {
+            return false;
+        }
+
+        String dst = ip(data, 16);
+
+        if (dst.equals(CLIENT_IP)) {
+            return false;
+        }
+
+        if (dst.equals("255.255.255.255")) {
+            return false;
+        }
+
+        if (dst.endsWith(".255")) {
+            return false;
+        }
+
+        int first = data[16] & 0xFF;
+
+        if (first >= 224) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private boolean shouldAcceptFromServer(byte[] data) {
+
+        if (!isIpv4(data)) {
+            return false;
+        }
+
+        String dst = ip(data, 16);
+
+        return dst.equals(CLIENT_IP);
     }
 
     private void logEvery(AtomicLong counter, String direction, byte[] data) {
