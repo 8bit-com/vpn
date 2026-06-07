@@ -21,6 +21,7 @@ public class Client {
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
     private static final int LOG_EVERY_PACKETS = 100;
+    private static final int MTU = 1400;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String SERVER_TUN_IP = "10.0.0.1";
@@ -37,6 +38,7 @@ public class Client {
         Pointer session = startWintun();
 
         configureMyVpnIp();
+        configureMtu();
         configureRoutes();
 
         DatagramSocket socket = createUdpSocket();
@@ -134,6 +136,22 @@ public class Client {
         );
 
         System.out.println("MYVPN IP CONFIGURED");
+    }
+
+    private void configureMtu() throws Exception {
+
+        runCommand(
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                ADAPTER_NAME,
+                "mtu=" + MTU,
+                "store=active"
+        );
+
+        System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
     private void configureRoutes() throws Exception {
