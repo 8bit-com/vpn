@@ -22,8 +22,8 @@ public class Client {
     private static final int SERVER_PORT = 51888;
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
-    private static final int LOG_EVERY_PACKETS = 1;
-    private static final int MTU = 1280;
+    private static final int LOG_EVERY_PACKETS = 50;
+    private static final int MTU = 1200;
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String SERVER_TUN_IP = "10.0.0.1";
