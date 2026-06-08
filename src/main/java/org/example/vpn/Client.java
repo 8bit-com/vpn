@@ -165,15 +165,26 @@ public class Client {
         String mask = tunAddressMask();
         int ifIndex = windowsInterfaceIndex(tunName);
 
+        runOptionalCommand("powershell", "-NoProfile", "-Command", "Disable-NetAdapterBinding -Name '" + psEscape(tunName) + "' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue");
         runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
         runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
+        runOptionalCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "forwarding=enabled");
 
         for (String target : windowsRouteTargets()) {
             runOptionalCommand("route", "delete", target);
             runRequiredCommand("route", "add", target, "mask", "255.255.255.255", WINDOWS_ON_LINK_GATEWAY, "if", String.valueOf(ifIndex), "metric", "1");
             System.out.println("ROUTE " + target + " -> on-link if " + ifIndex);
         }
+
+        printWindowsNetworkDiagnostics();
+    }
+
+    private void printWindowsNetworkDiagnostics() {
+        runAndPrint("WINDOWS ADAPTER", "powershell", "-NoProfile", "-Command", "Get-NetAdapter -Name '" + psEscape(tunName) + "' | Format-List ifIndex,Name,InterfaceDescription,Status");
+        runAndPrint("WINDOWS IP CONFIG", "powershell", "-NoProfile", "-Command", "Get-NetIPConfiguration -InterfaceAlias '" + psEscape(tunName) + "' | Format-List");
+        runAndPrint("WINDOWS ROUTE", "powershell", "-NoProfile", "-Command", "Get-NetRoute -DestinationPrefix " + tunGateway + "/32 | Format-List ifIndex,DestinationPrefix,NextHop,RouteMetric,InterfaceMetric");
+        runAndPrint("WINDOWS ROUTE PRINT", "route", "print", tunGateway);
     }
 
     private void startPacketPumpThreads() {
@@ -315,7 +326,7 @@ public class Client {
 
     private int windowsInterfaceIndex(String interfaceName) throws Exception {
         Process process = new ProcessBuilder("powershell", "-NoProfile", "-Command",
-                "(Get-NetAdapter -Name '" + interfaceName.replace("'", "''") + "').ifIndex")
+                "(Get-NetAdapter -Name '" + psEscape(interfaceName) + "').ifIndex")
                 .redirectErrorStream(true)
                 .start();
 
@@ -398,6 +409,26 @@ public class Client {
             process.waitFor();
         } catch (Exception ignored) {
         }
+    }
+
+    private void runAndPrint(String title, String... command) {
+        System.out.println("===== " + title + " =====");
+        try {
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println(line);
+                }
+            }
+            process.waitFor();
+        } catch (Exception e) {
+            System.out.println("DIAG FAILED: " + e.getMessage());
+        }
+    }
+
+    private String psEscape(String value) {
+        return value.replace("'", "''");
     }
 
     private void sleepBeforeRetry() {
