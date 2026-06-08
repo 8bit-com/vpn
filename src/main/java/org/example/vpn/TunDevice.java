@@ -14,13 +14,25 @@ public class TunDevice {
     private static final int MAX_PACKET_SIZE = 65535;
 
     private int fd;
+    private boolean windows;
 
     public void open(String tunName) {
-        fd = openTun(tunName);
+        windows = System.getProperty("os.name", "").toLowerCase().contains("win");
+
+        if (windows) {
+            openWindowsTun(tunName);
+            return;
+        }
+
+        fd = openLinuxTun(tunName);
         System.out.println(tunName + " opened");
     }
 
     public byte[] readPacket() {
+        if (windows) {
+            throw new UnsupportedOperationException("Windows TUN is not wired yet. Install Wintun and add JNA bindings next.");
+        }
+
         byte[] buffer = new byte[MAX_PACKET_SIZE];
         int len = LibC.INSTANCE.read(fd, buffer, buffer.length);
         if (len <= 0) {
@@ -30,6 +42,10 @@ public class TunDevice {
     }
 
     public void writePacket(byte[] data) {
+        if (windows) {
+            throw new UnsupportedOperationException("Windows TUN is not wired yet. Install Wintun and add JNA bindings next.");
+        }
+
         int written = LibC.INSTANCE.write(fd, data, data.length);
 
         if (written != data.length) {
@@ -37,7 +53,12 @@ public class TunDevice {
         }
     }
 
-    private int openTun(String tunName) {
+    private void openWindowsTun(String tunName) {
+        System.out.println("Windows detected. Linux /dev/net/tun is disabled for client.");
+        System.out.println("Next required step: put wintun.dll near the application and wire Wintun session API.");
+    }
+
+    private int openLinuxTun(String tunName) {
         int fd = LibC.INSTANCE.open("/dev/net/tun", O_RDWR);
 
         if (fd < 0) {
