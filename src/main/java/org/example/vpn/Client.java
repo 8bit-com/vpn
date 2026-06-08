@@ -62,20 +62,6 @@ public class Client {
         System.out.println("NOW CHECK ONLY THIS: ping " + tunGateway);
     }
 
-    private void runSyntheticIcmpHttpTest() throws Exception {
-        byte[] request = buildSyntheticIcmpEchoRequest(tunAddressIpOnly(), tunGateway);
-        postPacketToServer(request);
-        long deadline = System.currentTimeMillis() + 30000;
-        while (System.currentTimeMillis() < deadline) {
-            byte[] reply = pollPacketFromServer();
-            if (reply != null && isExpectedSyntheticReply(reply)) {
-                System.out.println("SYNTHETIC TEST OK");
-                return;
-            }
-        }
-        throw new RuntimeException("SYNTHETIC TEST FAILED");
-    }
-
     private void configureOperatingSystemRoutes() throws Exception {
         if (isWindows()) {
             configureWindowsNetwork();
@@ -106,11 +92,21 @@ public class Client {
         for (String target : windowsRouteTargets()) {
             addWindowsRoute(target);
         }
+        validateWindowsRouteChoice(tunGateway);
     }
 
     private void addWindowsRoute(String target) throws Exception {
         String command = "New-NetRoute -DestinationPrefix '" + target + "/32' -InterfaceAlias '" + psEscape(tunName) + "' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore";
         runRequiredCommand("powershell", "-NoProfile", "-Command", command);
+    }
+
+    private void validateWindowsRouteChoice(String target) throws Exception {
+        String command = "(Find-NetRoute -RemoteIPAddress '" + target + "' | Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' }).InterfaceAlias";
+        String selectedAlias = runAndCaptureFirstLine("powershell", "-NoProfile", "-Command", command);
+        if (!tunName.equalsIgnoreCase(selectedAlias == null ? "" : selectedAlias.trim())) {
+            throw new RuntimeException("Windows route to " + target + " is not selected through " + tunName + ". Selected: " + selectedAlias);
+        }
+        System.out.println("WINDOWS ROUTE OK " + target + " -> " + tunName);
     }
 
     private void cleanupWindowsRoutes() {
@@ -207,6 +203,20 @@ public class Client {
         return packet.length == 0 ? null : packet;
     }
 
+    private void runSyntheticIcmpHttpTest() throws Exception {
+        byte[] request = buildSyntheticIcmpEchoRequest(tunAddressIpOnly(), tunGateway);
+        postPacketToServer(request);
+        long deadline = System.currentTimeMillis() + 30000;
+        while (System.currentTimeMillis() < deadline) {
+            byte[] reply = pollPacketFromServer();
+            if (reply != null && isExpectedSyntheticReply(reply)) {
+                System.out.println("SYNTHETIC TEST OK");
+                return;
+            }
+        }
+        throw new RuntimeException("SYNTHETIC TEST FAILED");
+    }
+
     private boolean isExpectedSyntheticReply(byte[] packet) {
         if (!isIpv4Packet(packet) || packet.length < 28) {
             return false;
@@ -300,6 +310,18 @@ public class Client {
     private String prefixToMask(int prefix) {
         int mask = 0xffffffff << (32 - prefix);
         return ((mask >>> 24) & 0xff) + "." + ((mask >>> 16) & 0xff) + "." + ((mask >>> 8) & 0xff) + "." + (mask & 0xff);
+    }
+
+    private String runAndCaptureFirstLine(String... command) throws Exception {
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line = reader.readLine();
+            int code = process.waitFor();
+            if (code != 0) {
+                throw new RuntimeException("Command failed, code=" + code + ", command=" + String.join(" ", command));
+            }
+            return line;
+        }
     }
 
     private void runRequiredCommand(String... command) throws Exception {
