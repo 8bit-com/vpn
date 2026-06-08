@@ -82,17 +82,24 @@ public class Client {
     }
 
     private void configureWindowsNetwork() throws Exception {
-        String address = tunAddressIpOnly();
-        String mask = tunAddressMask();
-        runOptionalCommand("powershell", "-NoProfile", "-Command", "Disable-NetAdapterBinding -Name '" + psEscape(tunName) + "' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue");
-        runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
-        runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
-        runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
         cleanupWindowsRoutes();
+        cleanupWindowsIpAddress();
+
+        runOptionalCommand("powershell", "-NoProfile", "-Command", "Disable-NetAdapterBinding -Name '" + psEscape(tunName) + "' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue");
+        runOptionalCommand("powershell", "-NoProfile", "-Command", "Set-NetIPInterface -InterfaceAlias '" + psEscape(tunName) + "' -AddressFamily IPv4 -InterfaceMetric 1 -AutomaticMetric Disabled -ErrorAction SilentlyContinue");
+        runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
+
+        addWindowsIpAddress();
         for (String target : windowsRouteTargets()) {
             addWindowsRoute(target);
         }
         validateWindowsRouteChoice(tunGateway);
+    }
+
+    private void addWindowsIpAddress() throws Exception {
+        String command = "New-NetIPAddress -InterfaceAlias '" + psEscape(tunName) + "' -IPAddress '" + tunAddressIpOnly() + "' -PrefixLength " + tunPrefixLength() + " -PolicyStore ActiveStore";
+        runRequiredCommand("powershell", "-NoProfile", "-Command", command);
+        System.out.println("WINDOWS IP OK " + tunAddressIpOnly() + "/" + tunPrefixLength() + " -> " + tunName);
     }
 
     private void addWindowsRoute(String target) throws Exception {
@@ -114,12 +121,18 @@ public class Client {
             return;
         }
         for (String target : windowsRouteTargets()) {
-            String command = "Get-NetRoute -DestinationPrefix '" + target + "/32' -ErrorAction SilentlyContinue | "
-                    + "Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' } | "
-                    + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
+            String command = "Get-NetRoute -DestinationPrefix '" + target + "/32' -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
             runOptionalCommand("powershell", "-NoProfile", "-Command", command);
             runOptionalCommand("route", "delete", target);
         }
+    }
+
+    private void cleanupWindowsIpAddress() {
+        if (!isWindows()) {
+            return;
+        }
+        String command = "Get-NetIPAddress -InterfaceAlias '" + psEscape(tunName) + "' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue";
+        runOptionalCommand("powershell", "-NoProfile", "-Command", command);
     }
 
     private void startPacketPumpThreads() {
@@ -298,18 +311,12 @@ public class Client {
         return tunAddress.contains("/") ? tunAddress.substring(0, tunAddress.indexOf('/')) : tunAddress;
     }
 
-    private String tunAddressMask() {
-        int prefix = tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24;
-        return prefixToMask(prefix);
+    private int tunPrefixLength() {
+        return tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24;
     }
 
     private boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase().contains("win");
-    }
-
-    private String prefixToMask(int prefix) {
-        int mask = 0xffffffff << (32 - prefix);
-        return ((mask >>> 24) & 0xff) + "." + ((mask >>> 16) & 0xff) + "." + ((mask >>> 8) & 0xff) + "." + (mask & 0xff);
     }
 
     private String runAndCaptureFirstLine(String... command) throws Exception {
