@@ -5,6 +5,8 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -94,15 +96,36 @@ public class Client {
     private void configureWindowsNetwork() throws Exception {
         String address = tunAddress.contains("/") ? tunAddress.substring(0, tunAddress.indexOf('/')) : tunAddress;
         String mask = prefixToMask(tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24);
+        int ifIndex = windowsInterfaceIndex(tunName);
 
         runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
+        runCommandIgnoreError("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
 
         for (String target : windowsRouteTargets()) {
             runCommandIgnoreError("route", "delete", target);
-            runCommand("route", "add", target, "mask", "255.255.255.255", "0.0.0.0", "if", String.valueOf(tunDevice.interfaceIndex()), "metric", "1");
-            System.out.println("ROUTE " + target + " -> interface " + tunDevice.interfaceIndex());
+            runCommand("route", "add", target, "mask", "255.255.255.255", address, "if", String.valueOf(ifIndex), "metric", "1");
+            System.out.println("ROUTE " + target + " -> " + address + " if " + ifIndex);
         }
+    }
+
+    private int windowsInterfaceIndex(String interfaceName) throws Exception {
+        Process process = new ProcessBuilder("powershell", "-NoProfile", "-Command",
+                "(Get-NetAdapter -Name '" + interfaceName.replace("'", "''") + "').ifIndex")
+                .redirectErrorStream(true)
+                .start();
+
+        String line;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            line = reader.readLine();
+        }
+
+        int code = process.waitFor();
+        if (code != 0 || line == null || line.trim().isEmpty()) {
+            throw new RuntimeException("Cannot detect Windows interface index for " + interfaceName);
+        }
+
+        return Integer.parseInt(line.trim());
     }
 
     private Set<String> windowsRouteTargets() {
