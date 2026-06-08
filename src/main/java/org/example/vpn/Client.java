@@ -11,6 +11,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
@@ -96,12 +98,20 @@ public class Client {
         runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
 
-        for (String route : routeList()) {
-            String target = route.contains("/") ? route.substring(0, route.indexOf('/')) : route;
+        for (String target : windowsRouteTargets()) {
             runCommandIgnoreError("route", "delete", target);
-            runCommand("route", "add", target, "mask", "255.255.255.255", tunGateway, "metric", "1");
-            System.out.println("ROUTE " + target + " -> " + tunGateway);
+            runCommand("route", "add", target, "mask", "255.255.255.255", "0.0.0.0", "if", String.valueOf(tunDevice.interfaceIndex()), "metric", "1");
+            System.out.println("ROUTE " + target + " -> interface " + tunDevice.interfaceIndex());
         }
+    }
+
+    private Set<String> windowsRouteTargets() {
+        Set<String> result = new LinkedHashSet<>();
+        result.add(tunGateway);
+        for (String route : routeList()) {
+            result.add(route.contains("/") ? route.substring(0, route.indexOf('/')) : route);
+        }
+        return result;
     }
 
     private void readTunAndPostHttp() {
