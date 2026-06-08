@@ -102,12 +102,9 @@ public class Client {
 
     private void cleanupAdapterConfig() {
 
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "0.0.0.0");
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0");
-        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0");
-        runCommandIgnoreError("route", "delete", SERVER_HOST);
-        runCommandIgnoreError("route", "delete", SERVER_TUN_IP);
-
+        // Do NOT delete generic default routes here.
+        // Wide commands like "route delete 0.0.0.0 mask 0.0.0.0" can remove the real Windows/Amnezia default route.
+        // Ping-only mode does not create routes, so cleanup must only remove our own adapter IP.
         runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
 
         System.out.println("MYVPN CLEANUP DONE");
