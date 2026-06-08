@@ -23,7 +23,7 @@ public class Client {
     private static final int LOG_EVERY_PACKETS = 100;
     private static final int MAX_PACKET_SIZE = 65535;
     private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
-    private static final Duration HTTP_TX_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration HTTP_TX_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration HTTP_RX_TIMEOUT = Duration.ofSeconds(35);
     private static final long RETRY_DELAY_MS = 1000;
     private static final String WINDOWS_ON_LINK_GATEWAY = "0.0.0.0";
@@ -35,28 +35,23 @@ public class Client {
 
     private final AtomicLong tunToHttpCounter = new AtomicLong();
     private final AtomicLong httpToTunCounter = new AtomicLong();
+    private final AtomicLong rxCounter = new AtomicLong();
 
-    // Адрес HTTP-сервера. Клиент отправляет пакеты в /tx и забирает ответы из /rx.
     @Value("${vpn.server.url:http://80.240.23.72:8080}")
     private String serverUrl;
 
-    // Имя локального TUN-адаптера. На Windows оно должно совпадать с именем Wintun-адаптера.
     @Value("${vpn.tun.name:tun-http}")
     private String tunName;
 
-    // IP-адрес клиента внутри VPN-сети. Например: 10.8.0.2/24.
     @Value("${vpn.tun.address:10.8.0.2/24}")
     private String tunAddress;
 
-    // IP-адрес сервера внутри VPN-сети. Для внутренней проверки используется ping 10.8.0.1.
     @Value("${vpn.tun.gateway:10.8.0.1}")
     private String tunGateway;
 
     @Value("${vpn.mtu:1400}")
     private int mtu;
 
-    // Список внешних адресов через запятую, которые надо направить в туннель.
-    // Пример: vpn.routes=1.1.1.1,8.8.8.8
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
 
@@ -74,9 +69,6 @@ public class Client {
 
     /**
      * Открывает локальный виртуальный сетевой адаптер.
-     *
-     * Windows: TunDevice использует wintun.dll.
-     * Linux:   TunDevice использует /dev/net/tun через libc.
      */
     private void startTunAdapter() {
         tunDevice.open(tunName);
@@ -84,10 +76,6 @@ public class Client {
 
     /**
      * Настраивает IP-адрес, MTU и маршруты в операционной системе.
-     *
-     * Java-программа сможет читать пакеты из TUN-адаптера только после того,
-     * как таблица маршрутизации ОС начнёт отправлять нужный трафик в этот адаптер.
-     * Без этих маршрутов ping вообще не попадёт в наш Java-клиент.
      */
     private void configureOperatingSystemRoutes() throws Exception {
         if (isWindows()) {
@@ -100,8 +88,6 @@ public class Client {
 
     /**
      * Настройка клиента на Linux.
-     *
-     * Назначает адрес 10.8.0.2/24 на TUN-интерфейс и направляет выбранные адреса в этот интерфейс.
      */
     private void configureLinuxNetwork() throws Exception {
         runRequiredCommand("ip", "addr", "flush", "dev", tunName);
@@ -118,26 +104,16 @@ public class Client {
 
     /**
      * Настройка клиента на Windows.
-     *
-     * Важная деталь:
-     * Wintun возвращает LUID, но route.exe требует настоящий Windows interface index.
-     * Поэтому индекс интерфейса берётся через PowerShell Get-NetAdapter,
-     * а не через WintunGetAdapterLUID.
      */
     private void configureWindowsNetwork() throws Exception {
         String address = tunAddressIpOnly();
         String mask = tunAddressMask();
         int ifIndex = windowsInterfaceIndex(tunName);
 
-        // Назначаем Wintun-адаптеру клиентский VPN-адрес.
         runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
-
-        // MTU на Windows может не примениться в зависимости от состояния адаптера, поэтому команда необязательная.
         runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
 
-        // Для Wintun маршрут должен быть on-link: шлюз 0.0.0.0 + конкретный ifIndex.
-        // Если поставить шлюзом 10.8.0.2, Windows может не отдавать ICMP в Wintun как надо.
         for (String target : windowsRouteTargets()) {
             runOptionalCommand("route", "delete", target);
             runRequiredCommand("route", "add", target, "mask", "255.255.255.255", WINDOWS_ON_LINK_GATEWAY, "if", String.valueOf(ifIndex), "metric", "1");
@@ -147,12 +123,6 @@ public class Client {
 
     /**
      * Запускает два постоянных цикла обмена пакетами.
-     *
-     * 1. tun-to-http:
-     *    читает сырые IP-пакеты из Wintun/TUN и отправляет их на сервер через POST /tx.
-     *
-     * 2. http-to-tun:
-     *    опрашивает сервер через GET /rx и записывает полученные сырые IP-пакеты обратно в Wintun/TUN.
      */
     private void startPacketPumpThreads() {
         Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
@@ -162,9 +132,6 @@ public class Client {
         txThread.start();
     }
 
-    /**
-     * Направление: локальная ОС -> TUN-адаптер -> Java-клиент -> HTTP POST /tx -> сервер.
-     */
     private void pumpTunToHttpForever() {
         while (true) {
             try {
@@ -183,14 +150,19 @@ public class Client {
         }
     }
 
-    /**
-     * Направление: сервер -> HTTP GET /rx -> Java-клиент -> TUN-адаптер -> локальная ОС.
-     */
     private void pumpHttpToTunForever() {
         while (true) {
             try {
                 byte[] packet = pollPacketFromServer();
                 if (packet == null) {
+                    continue;
+                }
+
+                long value = rxCounter.incrementAndGet();
+                System.out.println("HTTP RX CLIENT #" + value + " " + packet.length + " bytes " + PacketInfo.info(packet));
+
+                if (!isIpv4Packet(packet)) {
+                    System.out.println("DROP RX: not IPv4 " + packet.length + " bytes");
                     continue;
                 }
 
@@ -240,8 +212,6 @@ public class Client {
 
         HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
 
-        // 204 означает, что у сервера сейчас нет пакета для клиента.
-        // Для long polling это нормальная ситуация, а не ошибка.
         if (response.statusCode() == 204) {
             return null;
         }
@@ -252,6 +222,10 @@ public class Client {
 
         byte[] packet = response.body();
         return packet.length == 0 ? null : packet;
+    }
+
+    private boolean isIpv4Packet(byte[] packet) {
+        return packet.length >= 20 && ((packet[0] >> 4) & 0x0f) == 4;
     }
 
     private int windowsInterfaceIndex(String interfaceName) throws Exception {
@@ -275,10 +249,7 @@ public class Client {
 
     private Set<String> windowsRouteTargets() {
         Set<String> result = new LinkedHashSet<>();
-
-        // Этот маршрут нужен для проверки: ping 10.8.0.1
         result.add(tunGateway);
-
         result.addAll(Arrays.asList(externalRouteTargets()));
         return result;
     }
