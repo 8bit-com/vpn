@@ -26,6 +26,7 @@ public class Client {
     private static final Duration HTTP_TX_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration HTTP_RX_TIMEOUT = Duration.ofSeconds(35);
     private static final long RETRY_DELAY_MS = 1000;
+    private static final String WINDOWS_ON_LINK_GATEWAY = "0.0.0.0";
 
     private final TunDevice tunDevice;
     private final HttpClient httpClient = HttpClient.newBuilder()
@@ -135,11 +136,12 @@ public class Client {
         // MTU на Windows может не примениться в зависимости от состояния адаптера, поэтому команда необязательная.
         runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
 
-        // Направляем в Wintun и внутренний адрес сервера, и внешние адреса из vpn.routes.
+        // Для Wintun маршрут должен быть on-link: шлюз 0.0.0.0 + конкретный ifIndex.
+        // Если поставить шлюзом 10.8.0.2, Windows может не отдавать ICMP в Wintun как надо.
         for (String target : windowsRouteTargets()) {
             runOptionalCommand("route", "delete", target);
-            runRequiredCommand("route", "add", target, "mask", "255.255.255.255", address, "if", String.valueOf(ifIndex), "metric", "1");
-            System.out.println("ROUTE " + target + " -> " + address + " if " + ifIndex);
+            runRequiredCommand("route", "add", target, "mask", "255.255.255.255", WINDOWS_ON_LINK_GATEWAY, "if", String.valueOf(ifIndex), "metric", "1");
+            System.out.println("ROUTE " + target + " -> on-link if " + ifIndex);
         }
     }
 
