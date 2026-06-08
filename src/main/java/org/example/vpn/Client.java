@@ -12,6 +12,7 @@ import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -37,7 +38,7 @@ public class Client {
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
     private static final int MTU = 1200;
-    private static final int LOG_EVERY_PACKETS = 1;
+    private static final int LOG_EVERY_PACKETS = 100;
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToUdpCounter = new AtomicLong();
@@ -54,10 +55,9 @@ public class Client {
         configureMtu();
         configureTestRoutes();
 
-        DatagramSocket socket = createUdpSocket();
+        DatagramSocket socket = createConnectedUdpSocket();
 
-        register(socket);
-
+        startHeartbeat(socket);
         startWintunToUdp(socket, session);
 
         System.out.println("TEST ROUTES MODE READY");
@@ -89,14 +89,15 @@ public class Client {
         return session;
     }
 
-    private DatagramSocket createUdpSocket() throws Exception {
+    private DatagramSocket createConnectedUdpSocket() throws Exception {
 
         DatagramSocket socket = new DatagramSocket();
 
         socket.setReceiveBufferSize(UDP_BUFFER_SIZE);
         socket.setSendBufferSize(UDP_BUFFER_SIZE);
+        socket.connect(new InetSocketAddress(InetAddress.getByName(SERVER_HOST), SERVER_PORT));
 
-        System.out.println("UDP SOCKET READY");
+        System.out.println("UDP SOCKET CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
 
         return socket;
     }
@@ -161,13 +162,27 @@ public class Client {
         System.out.println("MYVPN CLEANUP DONE");
     }
 
-    private void register(DatagramSocket socket) throws Exception {
+    private void startHeartbeat(DatagramSocket socket) {
+
+        Thread thread = new Thread(() -> {
+            while (true) {
+                try {
+                    sendHello(socket);
+                    Thread.sleep(1000);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }, "udp-heartbeat");
+
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void sendHello(DatagramSocket socket) throws Exception {
 
         byte[] data = "HELLO".getBytes();
-
-        socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
-
-        System.out.println("REGISTERED TO SERVER " + SERVER_HOST + ":" + SERVER_PORT);
+        socket.send(new DatagramPacket(data, data.length));
     }
 
     private void startWintunToUdp(DatagramSocket socket, Pointer session) {
@@ -199,7 +214,7 @@ public class Client {
                     continue;
                 }
 
-                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
+                socket.send(new DatagramPacket(data, data.length));
 
                 logEvery(wintunToUdpCounter, "WINTUN -> UDP", data);
 
@@ -209,23 +224,28 @@ public class Client {
         }
     }
 
-    private void receiveUdpAndWriteToWintun(DatagramSocket socket, Pointer session) throws Exception {
+    private void receiveUdpAndWriteToWintun(DatagramSocket socket, Pointer session) {
 
         while (true) {
 
-            DatagramPacket udpPacket = new DatagramPacket(new byte[65535], 65535);
+            try {
+                DatagramPacket udpPacket = new DatagramPacket(new byte[65535], 65535);
 
-            socket.receive(udpPacket);
+                socket.receive(udpPacket);
 
-            byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
+                byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
 
-            if (!shouldAcceptFromServer(data)) {
-                continue;
+                if (!shouldAcceptFromServer(data)) {
+                    continue;
+                }
+
+                writeToWintun(session, data);
+
+                logEvery(udpToWintunCounter, "UDP -> WINTUN", data);
+
+            } catch (Exception e) {
+                e.printStackTrace();
             }
-
-            writeToWintun(session, data);
-
-            logEvery(udpToWintunCounter, "UDP -> WINTUN", data);
         }
     }
 
