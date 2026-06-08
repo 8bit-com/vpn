@@ -23,6 +23,7 @@ public class TunDevice {
     private static final int ERROR_NO_MORE_ITEMS = 259;
 
     private final AtomicLong windowsReadCounter = new AtomicLong();
+    private final AtomicLong windowsWriteCounter = new AtomicLong();
 
     private int fd;
     private boolean windows;
@@ -121,6 +122,8 @@ public class TunDevice {
     }
 
     private void writeWindowsPacket(byte[] data) {
+        logWindowsWrite(data);
+
         Pointer packet = Wintun.INSTANCE.WintunAllocateSendPacket(session, data.length);
 
         if (packet == null || Pointer.nativeValue(packet) == 0) {
@@ -135,6 +138,13 @@ public class TunDevice {
         long count = windowsReadCounter.incrementAndGet();
         if (count <= 30 || count % 100 == 0) {
             System.out.println("wintun read #" + count + " " + packet.length + " bytes " + PacketInfo.info(packet));
+        }
+    }
+
+    private void logWindowsWrite(byte[] packet) {
+        long count = windowsWriteCounter.incrementAndGet();
+        if (count <= 30 || count % 100 == 0) {
+            System.out.println("wintun write #" + count + " " + packet.length + " bytes " + PacketInfo.info(packet));
         }
     }
 
