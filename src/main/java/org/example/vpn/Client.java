@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class Client {
 
     private static final String SERVER_HOST = "80.240.23.72";
-    private static final int SERVER_PORT = 51888;
+    private static final int SERVER_PORT = 443;
 
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
