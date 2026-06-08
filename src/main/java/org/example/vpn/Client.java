@@ -38,10 +38,14 @@ public class Client {
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
     private static final int MTU = 1200;
-    private static final int LOG_EVERY_PACKETS = 100;
+    private static final int LOG_EVERY_PACKETS = 1;
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToUdpCounter = new AtomicLong();
+    private final AtomicLong wintunRawCounter = new AtomicLong();
+    private final AtomicLong wintunDropCounter = new AtomicLong();
+    private final AtomicLong udpRawCounter = new AtomicLong();
+    private final AtomicLong udpDropCounter = new AtomicLong();
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
@@ -210,7 +214,10 @@ public class Client {
 
                 Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
 
+                logEvery(wintunRawCounter, "WINTUN RAW", data);
+
                 if (!shouldSendToServer(data)) {
+                    logEvery(wintunDropCounter, "WINTUN DROP", data);
                     continue;
                 }
 
@@ -235,7 +242,10 @@ public class Client {
 
                 byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
 
+                logEvery(udpRawCounter, "UDP RAW", data);
+
                 if (!shouldAcceptFromServer(data)) {
+                    logEvery(udpDropCounter, "UDP DROP", data);
                     continue;
                 }
 
