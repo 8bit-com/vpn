@@ -8,6 +8,7 @@ import com.sun.jna.ptr.IntByReference;
 import org.springframework.stereotype.Component;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 public class TunDevice {
@@ -18,12 +19,16 @@ public class TunDevice {
     private static final long TUNSETIFF = 0x400454caL;
     private static final int MAX_PACKET_SIZE = 65535;
     private static final int WINTUN_SESSION_CAPACITY = 0x400000;
+    private static final int INFINITE = -1;
+    private static final int ERROR_NO_MORE_ITEMS = 259;
+
+    private final AtomicLong windowsReadCounter = new AtomicLong();
 
     private int fd;
     private boolean windows;
     private Pointer adapter;
     private Pointer session;
-    private int interfaceIndex;
+    private Pointer readWaitEvent;
 
     public void open(String tunName) {
         windows = System.getProperty("os.name", "").toLowerCase().contains("win");
@@ -37,13 +42,9 @@ public class TunDevice {
         System.out.println(tunName + " opened");
     }
 
-    public int interfaceIndex() {
-        return interfaceIndex;
-    }
-
     public byte[] readPacket() {
         if (windows) {
-            return readWindowsPacket();
+            return readWindowsPacketBlocking();
         }
 
         byte[] buffer = new byte[MAX_PACKET_SIZE];
@@ -79,34 +80,44 @@ public class TunDevice {
                 throw new RuntimeException("WintunCreateAdapter failed, lastError=" + Native.getLastError());
             }
 
-            IntByReference indexRef = new IntByReference();
-            Wintun.INSTANCE.WintunGetAdapterLUID(adapter, indexRef);
-            interfaceIndex = indexRef.getValue();
-
             session = Wintun.INSTANCE.WintunStartSession(adapter, WINTUN_SESSION_CAPACITY);
 
             if (session == null || Pointer.nativeValue(session) == 0) {
                 throw new RuntimeException("WintunStartSession failed, lastError=" + Native.getLastError());
             }
 
-            System.out.println(tunName + " opened by wintun.dll, interface=" + interfaceIndex);
+            readWaitEvent = Wintun.INSTANCE.WintunGetReadWaitEvent(session);
+            if (readWaitEvent == null || Pointer.nativeValue(readWaitEvent) == 0) {
+                throw new RuntimeException("WintunGetReadWaitEvent failed, lastError=" + Native.getLastError());
+            }
+
+            System.out.println(tunName + " opened by wintun.dll");
         } catch (UnsatisfiedLinkError e) {
             throw new RuntimeException("wintun.dll not found. Put wintun.dll near java.exe working directory or add it to PATH", e);
         }
     }
 
-    private byte[] readWindowsPacket() {
-        IntByReference packetSizeRef = new IntByReference();
-        Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, packetSizeRef);
+    private byte[] readWindowsPacketBlocking() {
+        while (true) {
+            IntByReference packetSizeRef = new IntByReference();
+            Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, packetSizeRef);
 
-        if (packet == null || Pointer.nativeValue(packet) == 0) {
-            return null;
+            if (packet != null && Pointer.nativeValue(packet) != 0) {
+                int packetSize = packetSizeRef.getValue();
+                byte[] result = packet.getByteArray(0, packetSize);
+                Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
+                logWindowsRead(result);
+                return result;
+            }
+
+            int lastError = Native.getLastError();
+            if (lastError == ERROR_NO_MORE_ITEMS) {
+                Kernel32.INSTANCE.WaitForSingleObject(readWaitEvent, INFINITE);
+                continue;
+            }
+
+            throw new RuntimeException("WintunReceivePacket failed, lastError=" + lastError);
         }
-
-        int packetSize = packetSizeRef.getValue();
-        byte[] result = packet.getByteArray(0, packetSize);
-        Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
-        return result;
     }
 
     private void writeWindowsPacket(byte[] data) {
@@ -118,6 +129,13 @@ public class TunDevice {
 
         packet.write(0, data, 0, data.length);
         Wintun.INSTANCE.WintunSendPacket(session, packet);
+    }
+
+    private void logWindowsRead(byte[] packet) {
+        long count = windowsReadCounter.incrementAndGet();
+        if (count <= 30 || count % 100 == 0) {
+            System.out.println("wintun read #" + count + " " + packet.length + " bytes " + PacketInfo.info(packet));
+        }
     }
 
     private int openLinuxTun(String tunName) {
@@ -157,11 +175,11 @@ public class TunDevice {
 
         boolean WintunDeleteAdapter(Pointer adapter, boolean forceCloseSessions);
 
-        void WintunGetAdapterLUID(Pointer adapter, IntByReference luid);
-
         Pointer WintunStartSession(Pointer adapter, int capacity);
 
         void WintunEndSession(Pointer session);
+
+        Pointer WintunGetReadWaitEvent(Pointer session);
 
         Pointer WintunReceivePacket(Pointer session, IntByReference packetSize);
 
@@ -170,5 +188,12 @@ public class TunDevice {
         Pointer WintunAllocateSendPacket(Pointer session, int packetSize);
 
         void WintunSendPacket(Pointer session, Pointer packet);
+    }
+
+    private interface Kernel32 extends Library {
+
+        Kernel32 INSTANCE = Native.load("kernel32", Kernel32.class);
+
+        int WaitForSingleObject(Pointer handle, int milliseconds);
     }
 }
