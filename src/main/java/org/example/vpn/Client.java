@@ -1,311 +1,139 @@
 package org.example.vpn;
 
-import com.sun.jna.Pointer;
-import com.sun.jna.WString;
-import com.sun.jna.ptr.IntByReference;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.InputStreamReader;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.util.List;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class Client {
 
-    private static final String SERVER_HOST = "80.240.23.72";
-    private static final int SERVER_PORT = 51888;
-
-    private static final String ADAPTER_NAME = "MyVPN";
-    private static final String CLIENT_IP = "10.0.0.123";
-    private static final String CLIENT_MASK = "255.255.255.0";
-    private static final String SERVER_TUN_IP = "10.0.0.1";
-
-    private static final List<String> TEST_EXTERNAL_IPS = List.of(
-            "1.1.1.1",
-            "8.8.8.8",
-            "93.184.216.34",
-            "142.250.185.14"
-    );
-
-    private static final int WINTUN_RING_SIZE = 0x400000;
-    private static final int MTU = 1200;
-    private static final int LOG_EVERY_PACKETS = 1;
+    private static final int LOG_EVERY_PACKETS = 100;
     private static final int MAX_PACKET_SIZE = 65535;
-    private static final int CONNECT_TIMEOUT_MS = 5000;
-    private static final int RECONNECT_DELAY_MS = 3000;
 
-    private final AtomicLong tcpToWintunCounter = new AtomicLong();
-    private final AtomicLong wintunToTcpCounter = new AtomicLong();
-    private final AtomicLong wintunRawCounter = new AtomicLong();
-    private final AtomicLong wintunDropCounter = new AtomicLong();
-    private final AtomicLong tcpDropCounter = new AtomicLong();
-    private final AtomicReference<DataOutputStream> activeTcpOut = new AtomicReference<>();
+    private final TunDevice tunDevice;
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+
+    private final AtomicLong tunToHttpCounter = new AtomicLong();
+    private final AtomicLong httpToTunCounter = new AtomicLong();
+
+    @Value("${vpn.server.url:http://80.240.23.72:8080}")
+    private String serverUrl;
+
+    @Value("${vpn.tun.name:tun-http}")
+    private String tunName;
+
+    @Value("${vpn.tun.address:10.8.0.2/24}")
+    private String tunAddress;
+
+    @Value("${vpn.mtu:1400}")
+    private int mtu;
+
+    @Value("${vpn.routes:1.1.1.1}")
+    private String routes;
+
+    public Client(TunDevice tunDevice) {
+        this.tunDevice = tunDevice;
+    }
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
 
-        cleanupAdapterConfig();
-        Runtime.getRuntime().addShutdownHook(new Thread(this::cleanupAdapterConfig, "myvpn-cleanup"));
+        runCommandIgnoreError("ip", "link", "delete", tunName);
+        tunDevice.open(tunName);
+        configureLinuxNetwork();
 
-        Pointer session = startWintun();
+        Thread rxThread = new Thread(this::readHttpAndWriteTun, "http-to-tun");
+        rxThread.start();
 
-        configureMyVpnIp();
-        configureMtu();
-        configureTestRoutes();
+        Thread txThread = new Thread(this::readTunAndPostHttp, "tun-to-http");
+        txThread.start();
 
-        startWintunToTcp(session);
-
-        System.out.println("TEST ROUTES MODE READY");
-        System.out.println("CHECK INTERNAL: ping " + SERVER_TUN_IP);
-        for (String ip : TEST_EXTERNAL_IPS) {
-            System.out.println("CHECK EXTERNAL: ping " + ip);
+        System.out.println("HTTP VPN CLIENT READY");
+        System.out.println("CHECK INTERNAL: ping 10.8.0.1");
+        for (String route : routeList()) {
+            System.out.println("CHECK EXTERNAL: ping " + route);
         }
-        System.out.println("CHECK CURL: curl http://93.184.216.34");
-
-        tcpReconnectLoop(session);
     }
 
-    private Pointer startWintun() {
+    private void configureLinuxNetwork() throws Exception {
+        runCommand("ip", "addr", "flush", "dev", tunName);
+        runCommand("ip", "addr", "add", tunAddress, "dev", tunName);
+        runCommand("ip", "link", "set", "dev", tunName, "mtu", String.valueOf(mtu));
+        runCommand("ip", "link", "set", tunName, "up");
 
-        Pointer adapter = Wintun.INSTANCE.WintunCreateAdapter(new WString(ADAPTER_NAME), new WString("VPN"), null);
-
-        if (adapter == null) {
-            throw new RuntimeException("WintunCreateAdapter failed");
+        for (String route : routeList()) {
+            String target = route.contains("/") ? route : route + "/32";
+            runCommand("ip", "route", "replace", target, "dev", tunName);
+            System.out.println("ROUTE " + target + " -> " + tunName);
         }
-
-        Pointer session = Wintun.INSTANCE.WintunStartSession(adapter, WINTUN_RING_SIZE);
-
-        if (session == null) {
-            throw new RuntimeException("WintunStartSession failed");
-        }
-
-        System.out.println("WINTUN STARTED");
-
-        return session;
     }
 
-    private void tcpReconnectLoop(Pointer session) {
-
+    private void readTunAndPostHttp() {
         while (true) {
-            Socket socket = null;
-            DataOutputStream out = null;
-
             try {
-                System.out.println("TCP CONNECTING TO " + SERVER_HOST + ":" + SERVER_PORT);
+                byte[] packet = tunDevice.readPacket();
+                if (packet == null || packet.length > MAX_PACKET_SIZE) {
+                    continue;
+                }
 
-                socket = new Socket();
-                socket.setTcpNoDelay(true);
-                socket.setKeepAlive(true);
-                socket.connect(new InetSocketAddress(SERVER_HOST, SERVER_PORT), CONNECT_TIMEOUT_MS);
+                HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/tx"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Content-Type", "application/octet-stream")
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(packet))
+                        .build();
 
-                DataInputStream in = new DataInputStream(socket.getInputStream());
-                out = new DataOutputStream(socket.getOutputStream());
+                HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+                if (response.statusCode() != 204) {
+                    throw new RuntimeException("bad /tx status " + response.statusCode());
+                }
 
-                activeTcpOut.set(out);
-
-                System.out.println("TCP CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
-
-                receiveTcpAndWriteToWintun(in, session);
+                logEvery(tunToHttpCounter, "tun -> http", packet);
 
             } catch (Exception e) {
-                System.out.println("TCP CONNECT FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-            } finally {
-                if (out != null) {
-                    activeTcpOut.compareAndSet(out, null);
-                } else {
-                    activeTcpOut.set(null);
-                }
-                closeQuietly(socket);
-                sleep(RECONNECT_DELAY_MS);
+                System.out.println("tun -> http retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                sleep();
             }
         }
     }
 
-    private void configureMyVpnIp() throws Exception {
-
-        runCommand("netsh", "interface", "ip", "set", "address", "name=" + ADAPTER_NAME, "static", CLIENT_IP, CLIENT_MASK);
-
-        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/24");
-    }
-
-    private void configureMtu() throws Exception {
-
-        runCommand("netsh", "interface", "ipv4", "set", "subinterface", ADAPTER_NAME, "mtu=" + MTU, "store=active");
-
-        System.out.println("MYVPN MTU CONFIGURED: " + MTU);
-    }
-
-    private void configureTestRoutes() throws Exception {
-
-        String interfaceIndex = getMyVpnInterfaceIndex();
-
-        for (String ip : TEST_EXTERNAL_IPS) {
-            runCommandIgnoreError("route", "delete", ip);
-            runCommand("route", "add", ip, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", interfaceIndex);
-            System.out.println("MYVPN TEST ROUTE CONFIGURED: " + ip + " ON-LINK IF " + interfaceIndex);
-        }
-    }
-
-    private String getMyVpnInterfaceIndex() throws Exception {
-
-        Process process = new ProcessBuilder(
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
-        ).redirectErrorStream(true).start();
-
-        String interfaceIndex;
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            interfaceIndex = reader.readLine();
-        }
-
-        int code = process.waitFor();
-
-        if (code != 0 || interfaceIndex == null || interfaceIndex.trim().isEmpty()) {
-            throw new RuntimeException("Cannot detect MyVPN interface index");
-        }
-
-        return interfaceIndex.trim();
-    }
-
-    private void cleanupAdapterConfig() {
-
-        for (String ip : TEST_EXTERNAL_IPS) {
-            runCommandIgnoreError("route", "delete", ip);
-        }
-
-        runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
-
-        System.out.println("MYVPN CLEANUP DONE");
-    }
-
-    private void startWintunToTcp(Pointer session) {
-
-        Thread thread = new Thread(() -> readWintunAndSendTcp(session), "wintun-to-tcp");
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private void readWintunAndSendTcp(Pointer session) {
-
+    private void readHttpAndWriteTun() {
         while (true) {
-
             try {
-                IntByReference size = new IntByReference();
+                HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/rx"))
+                        .timeout(Duration.ofSeconds(35))
+                        .GET()
+                        .build();
 
-                Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, size);
-
-                if (packet == null) {
-                    Thread.sleep(1);
+                HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() == 204) {
                     continue;
                 }
-
-                byte[] data = packet.getByteArray(0, size.getValue());
-
-                Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
-
-                logEvery(wintunRawCounter, "WINTUN RAW", data);
-
-                if (!shouldSendToServer(data)) {
-                    logEvery(wintunDropCounter, "WINTUN DROP", data);
-                    continue;
+                if (response.statusCode() != 200) {
+                    throw new RuntimeException("bad /rx status " + response.statusCode());
                 }
 
-                DataOutputStream out = activeTcpOut.get();
-
-                if (out == null) {
-                    logEvery(tcpDropCounter, "TCP NOT CONNECTED DROP", data);
-                    continue;
+                byte[] packet = response.body();
+                if (packet.length > 0) {
+                    tunDevice.writePacket(packet);
+                    logEvery(httpToTunCounter, "http -> tun", packet);
                 }
-
-                synchronized (out) {
-                    out.writeInt(data.length);
-                    out.write(data);
-                    out.flush();
-                }
-
-                logEvery(wintunToTcpCounter, "WINTUN -> TCP", data);
 
             } catch (Exception e) {
-                System.out.println("WINTUN -> TCP FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                activeTcpOut.set(null);
+                System.out.println("http -> tun retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                sleep();
             }
         }
-    }
-
-    private void receiveTcpAndWriteToWintun(DataInputStream in, Pointer session) throws Exception {
-
-        while (true) {
-            int len = in.readInt();
-
-            if (len <= 0 || len > MAX_PACKET_SIZE) {
-                throw new RuntimeException("bad tcp frame length: " + len);
-            }
-
-            byte[] data = in.readNBytes(len);
-
-            if (data.length != len) {
-                throw new RuntimeException("tcp frame truncated: " + data.length + "/" + len);
-            }
-
-            writeToWintun(session, data);
-
-            logEvery(tcpToWintunCounter, "TCP -> WINTUN", data);
-        }
-    }
-
-    private void writeToWintun(Pointer session, byte[] data) {
-
-        Pointer packet = Wintun.INSTANCE.WintunAllocateSendPacket(session, data.length);
-
-        if (packet == null) {
-            throw new RuntimeException("WintunAllocateSendPacket failed");
-        }
-
-        packet.write(0, data, 0, data.length);
-
-        Wintun.INSTANCE.WintunSendPacket(session, packet);
-    }
-
-    private boolean shouldSendToServer(byte[] data) {
-
-        if (!isIpv4(data)) {
-            return false;
-        }
-
-        String src = ip(data, 12);
-        String dst = ip(data, 16);
-
-        if (!src.equals(CLIENT_IP)) {
-            return false;
-        }
-
-        if (dst.equals(SERVER_TUN_IP)) {
-            return true;
-        }
-
-        return TEST_EXTERNAL_IPS.contains(dst);
-    }
-
-    private boolean isIpv4(byte[] data) {
-        return data.length >= 20 && (data[0] & 0xF0) == 0x40;
-    }
-
-    private String ip(byte[] data, int offset) {
-        return (data[offset] & 0xFF) + "." +
-                (data[offset + 1] & 0xFF) + "." +
-                (data[offset + 2] & 0xFF) + "." +
-                (data[offset + 3] & 0xFF);
     }
 
     private void logEvery(AtomicLong counter, String direction, byte[] data) {
@@ -317,6 +145,13 @@ public class Client {
         }
 
         System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
+    }
+
+    private String[] routeList() {
+        return Arrays.stream(routes.split(","))
+                .map(String::trim)
+                .filter(value -> !value.isEmpty())
+                .toArray(String[]::new);
     }
 
     private void runCommand(String... command) throws Exception {
@@ -339,20 +174,9 @@ public class Client {
         }
     }
 
-    private void closeQuietly(Socket socket) {
-        if (socket == null) {
-            return;
-        }
-
+    private void sleep() {
         try {
-            socket.close();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
+            Thread.sleep(1000);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
