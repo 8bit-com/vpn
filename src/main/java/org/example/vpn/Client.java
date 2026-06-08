@@ -55,28 +55,89 @@ public class Client {
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
 
+    @Value("${vpn.synthetic-test.enabled:true}")
+    private boolean syntheticTestEnabled;
+
     public Client(TunDevice tunDevice) {
         this.tunDevice = tunDevice;
     }
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
+        if (syntheticTestEnabled) {
+            runSyntheticIcmpHttpTest();
+        }
+
         startTunAdapter();
         configureOperatingSystemRoutes();
         startPacketPumpThreads();
         printReadyMessage();
     }
 
-    /**
-     * Открывает локальный виртуальный сетевой адаптер.
-     */
+    private void runSyntheticIcmpHttpTest() throws Exception {
+        byte[] request = buildSyntheticIcmpEchoRequest(tunAddressIpOnly(), tunGateway);
+        System.out.println("SYNTHETIC TX " + request.length + " bytes " + PacketInfo.info(request));
+        postPacketToServer(request);
+
+        long deadline = System.currentTimeMillis() + 30000;
+        while (System.currentTimeMillis() < deadline) {
+            byte[] reply = pollPacketFromServer();
+            if (reply == null) {
+                continue;
+            }
+
+            System.out.println("SYNTHETIC RX " + reply.length + " bytes " + PacketInfo.info(reply));
+            if (isExpectedSyntheticReply(reply)) {
+                System.out.println("SYNTHETIC TEST OK");
+                return;
+            }
+        }
+
+        throw new RuntimeException("SYNTHETIC TEST FAILED: no ICMP echo reply from server over HTTP");
+    }
+
+    private boolean isExpectedSyntheticReply(byte[] packet) {
+        if (!isIpv4Packet(packet) || packet.length < 28) {
+            return false;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        return (packet[9] & 0xff) == 1
+                && ip(packet, 12).equals(tunGateway)
+                && ip(packet, 16).equals(tunAddressIpOnly())
+                && (packet[ihl] & 0xff) == 0;
+    }
+
+    private byte[] buildSyntheticIcmpEchoRequest(String srcIp, String dstIp) {
+        byte[] packet = new byte[60];
+
+        packet[0] = 0x45;
+        packet[1] = 0;
+        putU16(packet, 2, packet.length);
+        putU16(packet, 4, 1);
+        putU16(packet, 6, 0);
+        packet[8] = 64;
+        packet[9] = 1;
+        putIp(packet, 12, srcIp);
+        putIp(packet, 16, dstIp);
+        putU16(packet, 10, checksum(packet, 0, 20));
+
+        int icmp = 20;
+        packet[icmp] = 8;
+        packet[icmp + 1] = 0;
+        putU16(packet, icmp + 4, 0x1234);
+        putU16(packet, icmp + 6, 1);
+        for (int i = icmp + 8; i < packet.length; i++) {
+            packet[i] = (byte) i;
+        }
+        putU16(packet, icmp + 2, checksum(packet, icmp, packet.length - icmp));
+
+        return packet;
+    }
+
     private void startTunAdapter() {
         tunDevice.open(tunName);
     }
 
-    /**
-     * Настраивает IP-адрес, MTU и маршруты в операционной системе.
-     */
     private void configureOperatingSystemRoutes() throws Exception {
         if (isWindows()) {
             configureWindowsNetwork();
@@ -86,9 +147,6 @@ public class Client {
         configureLinuxNetwork();
     }
 
-    /**
-     * Настройка клиента на Linux.
-     */
     private void configureLinuxNetwork() throws Exception {
         runRequiredCommand("ip", "addr", "flush", "dev", tunName);
         runRequiredCommand("ip", "addr", "add", tunAddress, "dev", tunName);
@@ -102,9 +160,6 @@ public class Client {
         }
     }
 
-    /**
-     * Настройка клиента на Windows.
-     */
     private void configureWindowsNetwork() throws Exception {
         String address = tunAddressIpOnly();
         String mask = tunAddressMask();
@@ -121,9 +176,6 @@ public class Client {
         }
     }
 
-    /**
-     * Запускает два постоянных цикла обмена пакетами.
-     */
     private void startPacketPumpThreads() {
         Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
         rxThread.start();
@@ -226,6 +278,39 @@ public class Client {
 
     private boolean isIpv4Packet(byte[] packet) {
         return packet.length >= 20 && ((packet[0] >> 4) & 0x0f) == 4;
+    }
+
+    private String ip(byte[] data, int offset) {
+        return (data[offset] & 0xff) + "." + (data[offset + 1] & 0xff) + "." + (data[offset + 2] & 0xff) + "." + (data[offset + 3] & 0xff);
+    }
+
+    private void putIp(byte[] data, int offset, String ip) {
+        String[] parts = ip.split("\\.");
+        for (int i = 0; i < 4; i++) {
+            data[offset + i] = (byte) Integer.parseInt(parts[i]);
+        }
+    }
+
+    private void putU16(byte[] data, int offset, int value) {
+        data[offset] = (byte) ((value >> 8) & 0xff);
+        data[offset + 1] = (byte) (value & 0xff);
+    }
+
+    private int checksum(byte[] data, int offset, int length) {
+        long sum = 0;
+        int i = offset;
+        while (length > 1) {
+            sum += ((data[i] & 0xff) << 8) | (data[i + 1] & 0xff);
+            i += 2;
+            length -= 2;
+        }
+        if (length > 0) {
+            sum += (data[i] & 0xff) << 8;
+        }
+        while ((sum >> 16) != 0) {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        return (int) (~sum) & 0xffff;
     }
 
     private int windowsInterfaceIndex(String interfaceName) throws Exception {
