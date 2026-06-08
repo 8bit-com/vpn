@@ -94,6 +94,7 @@ public class Client {
             addWindowsRoute(target);
         }
         validateWindowsRouteChoice(tunGateway);
+        printWindowsRoutingSnapshot();
     }
 
     private void addWindowsIpAddress() throws Exception {
@@ -114,6 +115,17 @@ public class Client {
             throw new RuntimeException("Windows route to " + target + " is not selected through " + tunName + ". Selected: " + selectedAlias);
         }
         System.out.println("WINDOWS ROUTE OK " + target + " -> " + tunName);
+    }
+
+    private void printWindowsRoutingSnapshot() {
+        System.out.println("===== WINDOWS ROUTING SNAPSHOT =====");
+        runAndPrint("ADAPTERS", "powershell", "-NoProfile", "-Command",
+                "Get-NetIPConfiguration | ForEach-Object { $a=$_.InterfaceAlias; $i=$_.InterfaceIndex; $ip=($_.IPv4Address.IPAddress -join ','); $gw=($_.IPv4DefaultGateway.NextHop -join ','); Write-Output \"if=$i alias=$a ip=$ip gw=$gw\" }");
+        runAndPrint("ROUTE CHOICE GATEWAY", "powershell", "-NoProfile", "-Command", "Find-NetRoute -RemoteIPAddress " + tunGateway + " | Format-List ifIndex,InterfaceAlias,IPAddress,NextHop,RouteMetric");
+        runAndPrint("ROUTE CHOICE SERVER", "powershell", "-NoProfile", "-Command", "Find-NetRoute -RemoteIPAddress " + serverIp() + " | Format-List ifIndex,InterfaceAlias,IPAddress,NextHop,RouteMetric");
+        for (String target : externalRouteTargets()) {
+            runAndPrint("ROUTE CHOICE " + target, "powershell", "-NoProfile", "-Command", "Find-NetRoute -RemoteIPAddress " + target + " | Format-List ifIndex,InterfaceAlias,IPAddress,NextHop,RouteMetric");
+        }
     }
 
     private void cleanupWindowsRoutes() {
@@ -315,6 +327,10 @@ public class Client {
         return tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24;
     }
 
+    private String serverIp() {
+        return URI.create(serverUrl).getHost();
+    }
+
     private boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
@@ -344,6 +360,22 @@ public class Client {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
         } catch (Exception ignored) {
+        }
+    }
+
+    private void runAndPrint(String title, String... command) {
+        System.out.println("--- " + title + " ---");
+        try {
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println(line);
+                }
+            }
+            process.waitFor();
+        } catch (Exception e) {
+            System.out.println("FAILED: " + e.getMessage());
         }
     }
 
