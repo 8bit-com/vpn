@@ -29,32 +29,23 @@ public class Client {
     private static final String WINDOWS_ON_LINK_GATEWAY = "0.0.0.0";
 
     private final TunDevice tunDevice;
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(HTTP_CONNECT_TIMEOUT)
-            .build();
-
+    private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(HTTP_CONNECT_TIMEOUT).build();
     private final AtomicLong tunToHttpCounter = new AtomicLong();
     private final AtomicLong httpToTunCounter = new AtomicLong();
     private final AtomicLong rxCounter = new AtomicLong();
 
     @Value("${vpn.server.url:http://80.240.23.72:8080}")
     private String serverUrl;
-
     @Value("${vpn.tun.name:tun-http}")
     private String tunName;
-
     @Value("${vpn.tun.address:10.8.0.2/24}")
     private String tunAddress;
-
     @Value("${vpn.tun.gateway:10.8.0.1}")
     private String tunGateway;
-
     @Value("${vpn.mtu:1400}")
     private int mtu;
-
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
-
     @Value("${vpn.synthetic-test.enabled:true}")
     private boolean syntheticTestEnabled;
 
@@ -67,9 +58,9 @@ public class Client {
         if (syntheticTestEnabled) {
             runSyntheticIcmpHttpTest();
         }
-
         startTunAdapter();
         configureOperatingSystemRoutes();
+        Runtime.getRuntime().addShutdownHook(new Thread(this::cleanupWindowsRoutes));
         startPacketPumpThreads();
         printReadyMessage();
     }
@@ -78,21 +69,18 @@ public class Client {
         byte[] request = buildSyntheticIcmpEchoRequest(tunAddressIpOnly(), tunGateway);
         System.out.println("SYNTHETIC TX " + request.length + " bytes " + PacketInfo.info(request));
         postPacketToServer(request);
-
         long deadline = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < deadline) {
             byte[] reply = pollPacketFromServer();
             if (reply == null) {
                 continue;
             }
-
             System.out.println("SYNTHETIC RX " + reply.length + " bytes " + PacketInfo.info(reply));
             if (isExpectedSyntheticReply(reply)) {
                 System.out.println("SYNTHETIC TEST OK");
                 return;
             }
         }
-
         throw new RuntimeException("SYNTHETIC TEST FAILED: no ICMP echo reply from server over HTTP");
     }
 
@@ -109,28 +97,22 @@ public class Client {
 
     private byte[] buildSyntheticIcmpEchoRequest(String srcIp, String dstIp) {
         byte[] packet = new byte[60];
-
         packet[0] = 0x45;
-        packet[1] = 0;
         putU16(packet, 2, packet.length);
         putU16(packet, 4, 1);
-        putU16(packet, 6, 0);
         packet[8] = 64;
         packet[9] = 1;
         putIp(packet, 12, srcIp);
         putIp(packet, 16, dstIp);
         putU16(packet, 10, checksum(packet, 0, 20));
-
         int icmp = 20;
         packet[icmp] = 8;
-        packet[icmp + 1] = 0;
         putU16(packet, icmp + 4, 0x1234);
         putU16(packet, icmp + 6, 1);
         for (int i = icmp + 8; i < packet.length; i++) {
             packet[i] = (byte) i;
         }
         putU16(packet, icmp + 2, checksum(packet, icmp, packet.length - icmp));
-
         return packet;
     }
 
@@ -143,7 +125,6 @@ public class Client {
             configureWindowsNetwork();
             return;
         }
-
         configureLinuxNetwork();
     }
 
@@ -152,7 +133,6 @@ public class Client {
         runRequiredCommand("ip", "addr", "add", tunAddress, "dev", tunName);
         runRequiredCommand("ip", "link", "set", "dev", tunName, "mtu", String.valueOf(mtu));
         runRequiredCommand("ip", "link", "set", tunName, "up");
-
         for (String route : externalRouteTargets()) {
             String target = route.contains("/") ? route : route + "/32";
             runRequiredCommand("ip", "route", "replace", target, "dev", tunName);
@@ -163,34 +143,46 @@ public class Client {
     private void configureWindowsNetwork() throws Exception {
         String address = tunAddressIpOnly();
         String mask = tunAddressMask();
-        int ifIndex = windowsInterfaceIndex(tunName);
-
         runOptionalCommand("powershell", "-NoProfile", "-Command", "Disable-NetAdapterBinding -Name '" + psEscape(tunName) + "' -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue");
         runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
         runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
-        runOptionalCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "forwarding=enabled");
-
+        cleanupWindowsRoutes();
         for (String target : windowsRouteTargets()) {
-            runOptionalCommand("route", "delete", target);
-            runRequiredCommand("route", "add", target, "mask", "255.255.255.255", WINDOWS_ON_LINK_GATEWAY, "if", String.valueOf(ifIndex), "metric", "1");
-            System.out.println("ROUTE " + target + " -> on-link if " + ifIndex);
+            addWindowsRoute(target);
         }
-
         printWindowsNetworkDiagnostics();
+    }
+
+    private void addWindowsRoute(String target) throws Exception {
+        String command = "New-NetRoute -DestinationPrefix '" + target + "/32' -InterfaceAlias '" + psEscape(tunName) + "' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore";
+        runRequiredCommand("powershell", "-NoProfile", "-Command", command);
+        System.out.println("ROUTE " + target + " -> New-NetRoute on-link " + tunName);
+    }
+
+    private void cleanupWindowsRoutes() {
+        if (!isWindows()) {
+            return;
+        }
+        for (String target : windowsRouteTargets()) {
+            String command = "Get-NetRoute -DestinationPrefix '" + target + "/32' -ErrorAction SilentlyContinue | "
+                    + "Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' -or $_.NextHop -eq '0.0.0.0' } | "
+                    + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
+            runOptionalCommand("powershell", "-NoProfile", "-Command", command);
+            runOptionalCommand("route", "delete", target);
+        }
     }
 
     private void printWindowsNetworkDiagnostics() {
         runAndPrint("WINDOWS ADAPTER", "powershell", "-NoProfile", "-Command", "Get-NetAdapter -Name '" + psEscape(tunName) + "' | Format-List ifIndex,Name,InterfaceDescription,Status");
         runAndPrint("WINDOWS IP CONFIG", "powershell", "-NoProfile", "-Command", "Get-NetIPConfiguration -InterfaceAlias '" + psEscape(tunName) + "' | Format-List");
-        runAndPrint("WINDOWS ROUTE", "powershell", "-NoProfile", "-Command", "Get-NetRoute -DestinationPrefix " + tunGateway + "/32 | Format-List ifIndex,DestinationPrefix,NextHop,RouteMetric,InterfaceMetric");
-        runAndPrint("WINDOWS ROUTE PRINT", "route", "print", tunGateway);
+        runAndPrint("WINDOWS ROUTE", "powershell", "-NoProfile", "-Command", "Get-NetRoute -DestinationPrefix " + tunGateway + "/32 | Format-List ifIndex,InterfaceAlias,DestinationPrefix,NextHop,RouteMetric,InterfaceMetric");
+        runAndPrint("WINDOWS ROUTE CHOICE", "powershell", "-NoProfile", "-Command", "Find-NetRoute -RemoteIPAddress " + tunGateway + " | Format-List ifIndex,InterfaceAlias,IPAddress,NextHop,RouteMetric");
     }
 
     private void startPacketPumpThreads() {
         Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
         rxThread.start();
-
         Thread txThread = new Thread(this::pumpTunToHttpForever, "tun-to-http");
         txThread.start();
     }
@@ -202,10 +194,8 @@ public class Client {
                 if (packet == null) {
                     continue;
                 }
-
                 postPacketToServer(packet);
                 logEvery(tunToHttpCounter, "tun -> http", packet);
-
             } catch (Exception e) {
                 System.out.println("tun -> http retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 sleepBeforeRetry();
@@ -220,18 +210,14 @@ public class Client {
                 if (packet == null) {
                     continue;
                 }
-
                 long value = rxCounter.incrementAndGet();
                 System.out.println("HTTP RX CLIENT #" + value + " " + packet.length + " bytes " + PacketInfo.info(packet));
-
                 if (!isIpv4Packet(packet)) {
                     System.out.println("DROP RX: not IPv4 " + packet.length + " bytes");
                     continue;
                 }
-
                 tunDevice.writePacket(packet);
                 logEvery(httpToTunCounter, "http -> tun", packet);
-
             } catch (Exception e) {
                 System.out.println("http -> tun retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 sleepBeforeRetry();
@@ -241,26 +227,18 @@ public class Client {
 
     private byte[] readPacketFromTun() {
         byte[] packet = tunDevice.readPacket();
-
         if (packet == null || packet.length == 0) {
             return null;
         }
-
         if (packet.length > MAX_PACKET_SIZE) {
             System.out.println("DROP TUN PACKET: too large " + packet.length + " bytes");
             return null;
         }
-
         return packet;
     }
 
     private void postPacketToServer(byte[] packet) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/tx"))
-                .timeout(HTTP_TX_TIMEOUT)
-                .header("Content-Type", "application/octet-stream")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(packet))
-                .build();
-
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/tx")).timeout(HTTP_TX_TIMEOUT).header("Content-Type", "application/octet-stream").POST(HttpRequest.BodyPublishers.ofByteArray(packet)).build();
         HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
         if (response.statusCode() != 204) {
             throw new RuntimeException("bad /tx status " + response.statusCode());
@@ -268,21 +246,14 @@ public class Client {
     }
 
     private byte[] pollPacketFromServer() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/rx"))
-                .timeout(HTTP_RX_TIMEOUT)
-                .GET()
-                .build();
-
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/rx")).timeout(HTTP_RX_TIMEOUT).GET().build();
         HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
-
         if (response.statusCode() == 204) {
             return null;
         }
-
         if (response.statusCode() != 200) {
             throw new RuntimeException("bad /rx status " + response.statusCode());
         }
-
         byte[] packet = response.body();
         return packet.length == 0 ? null : packet;
     }
@@ -324,25 +295,6 @@ public class Client {
         return (int) (~sum) & 0xffff;
     }
 
-    private int windowsInterfaceIndex(String interfaceName) throws Exception {
-        Process process = new ProcessBuilder("powershell", "-NoProfile", "-Command",
-                "(Get-NetAdapter -Name '" + psEscape(interfaceName) + "').ifIndex")
-                .redirectErrorStream(true)
-                .start();
-
-        String line;
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            line = reader.readLine();
-        }
-
-        int code = process.waitFor();
-        if (code != 0 || line == null || line.trim().isEmpty()) {
-            throw new RuntimeException("Cannot detect Windows interface index for " + interfaceName);
-        }
-
-        return Integer.parseInt(line.trim());
-    }
-
     private Set<String> windowsRouteTargets() {
         Set<String> result = new LinkedHashSet<>();
         result.add(tunGateway);
@@ -351,11 +303,7 @@ public class Client {
     }
 
     private String[] externalRouteTargets() {
-        return Arrays.stream(routes.split(","))
-                .map(String::trim)
-                .filter(value -> !value.isEmpty())
-                .map(value -> value.contains("/") ? value.substring(0, value.indexOf('/')) : value)
-                .toArray(String[]::new);
+        return Arrays.stream(routes.split(",")).map(String::trim).filter(value -> !value.isEmpty()).map(value -> value.contains("/") ? value.substring(0, value.indexOf('/')) : value).toArray(String[]::new);
     }
 
     private String tunAddressIpOnly() {
@@ -378,11 +326,9 @@ public class Client {
 
     private void logEvery(AtomicLong counter, String direction, byte[] data) {
         long value = counter.incrementAndGet();
-
         if (value % LOG_EVERY_PACKETS != 0) {
             return;
         }
-
         System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
     }
 
@@ -397,7 +343,6 @@ public class Client {
     private void runRequiredCommand(String... command) throws Exception {
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         int code = process.waitFor();
-
         if (code != 0) {
             throw new RuntimeException("Command failed, code=" + code + ", command=" + String.join(" ", command));
         }
