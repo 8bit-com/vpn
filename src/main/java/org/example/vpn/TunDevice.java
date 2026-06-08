@@ -1,5 +1,10 @@
 package org.example.vpn;
 
+import com.sun.jna.Library;
+import com.sun.jna.Native;
+import com.sun.jna.Pointer;
+import com.sun.jna.WString;
+import com.sun.jna.ptr.IntByReference;
 import org.springframework.stereotype.Component;
 
 import java.util.Arrays;
@@ -12,9 +17,12 @@ public class TunDevice {
     private static final short IFF_NO_PI = 0x1000;
     private static final long TUNSETIFF = 0x400454caL;
     private static final int MAX_PACKET_SIZE = 65535;
+    private static final int WINTUN_SESSION_CAPACITY = 0x400000;
 
     private int fd;
     private boolean windows;
+    private Pointer adapter;
+    private Pointer session;
 
     public void open(String tunName) {
         windows = System.getProperty("os.name", "").toLowerCase().contains("win");
@@ -30,7 +38,7 @@ public class TunDevice {
 
     public byte[] readPacket() {
         if (windows) {
-            throw new UnsupportedOperationException("Windows TUN is not wired yet. Install Wintun and add JNA bindings next.");
+            return readWindowsPacket();
         }
 
         byte[] buffer = new byte[MAX_PACKET_SIZE];
@@ -43,7 +51,8 @@ public class TunDevice {
 
     public void writePacket(byte[] data) {
         if (windows) {
-            throw new UnsupportedOperationException("Windows TUN is not wired yet. Install Wintun and add JNA bindings next.");
+            writeWindowsPacket(data);
+            return;
         }
 
         int written = LibC.INSTANCE.write(fd, data, data.length);
@@ -54,8 +63,52 @@ public class TunDevice {
     }
 
     private void openWindowsTun(String tunName) {
-        System.out.println("Windows detected. Linux /dev/net/tun is disabled for client.");
-        System.out.println("Next required step: put wintun.dll near the application and wire Wintun session API.");
+        try {
+            adapter = Wintun.INSTANCE.WintunOpenAdapter(new WString(tunName));
+
+            if (adapter == null || Pointer.nativeValue(adapter) == 0) {
+                adapter = Wintun.INSTANCE.WintunCreateAdapter(new WString(tunName), new WString("HTTPVPN"), null);
+            }
+
+            if (adapter == null || Pointer.nativeValue(adapter) == 0) {
+                throw new RuntimeException("WintunCreateAdapter failed, lastError=" + Native.getLastError());
+            }
+
+            session = Wintun.INSTANCE.WintunStartSession(adapter, WINTUN_SESSION_CAPACITY);
+
+            if (session == null || Pointer.nativeValue(session) == 0) {
+                throw new RuntimeException("WintunStartSession failed, lastError=" + Native.getLastError());
+            }
+
+            System.out.println(tunName + " opened by wintun.dll");
+        } catch (UnsatisfiedLinkError e) {
+            throw new RuntimeException("wintun.dll not found. Put wintun.dll near java.exe working directory or add it to PATH", e);
+        }
+    }
+
+    private byte[] readWindowsPacket() {
+        IntByReference packetSizeRef = new IntByReference();
+        Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, packetSizeRef);
+
+        if (packet == null || Pointer.nativeValue(packet) == 0) {
+            return null;
+        }
+
+        int packetSize = packetSizeRef.getValue();
+        byte[] result = packet.getByteArray(0, packetSize);
+        Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
+        return result;
+    }
+
+    private void writeWindowsPacket(byte[] data) {
+        Pointer packet = Wintun.INSTANCE.WintunAllocateSendPacket(session, data.length);
+
+        if (packet == null || Pointer.nativeValue(packet) == 0) {
+            throw new RuntimeException("WintunAllocateSendPacket failed, lastError=" + Native.getLastError());
+        }
+
+        packet.write(0, data, 0, data.length);
+        Wintun.INSTANCE.WintunSendPacket(session, packet);
     }
 
     private int openLinuxTun(String tunName) {
@@ -81,5 +134,30 @@ public class TunDevice {
         }
 
         return fd;
+    }
+
+    private interface Wintun extends Library {
+
+        Wintun INSTANCE = Native.load("wintun", Wintun.class);
+
+        Pointer WintunCreateAdapter(WString name, WString tunnelType, Pointer requestedGuid);
+
+        Pointer WintunOpenAdapter(WString name);
+
+        void WintunCloseAdapter(Pointer adapter);
+
+        boolean WintunDeleteAdapter(Pointer adapter, boolean forceCloseSessions);
+
+        Pointer WintunStartSession(Pointer adapter, int capacity);
+
+        void WintunEndSession(Pointer session);
+
+        Pointer WintunReceivePacket(Pointer session, IntByReference packetSize);
+
+        void WintunReleaseReceivePacket(Pointer session, Pointer packet);
+
+        Pointer WintunAllocateSendPacket(Pointer session, int packetSize);
+
+        void WintunSendPacket(Pointer session, Pointer packet);
     }
 }
