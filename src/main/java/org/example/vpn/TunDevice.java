@@ -23,6 +23,7 @@ public class TunDevice {
     private boolean windows;
     private Pointer adapter;
     private Pointer session;
+    private int interfaceIndex;
 
     public void open(String tunName) {
         windows = System.getProperty("os.name", "").toLowerCase().contains("win");
@@ -34,6 +35,10 @@ public class TunDevice {
 
         fd = openLinuxTun(tunName);
         System.out.println(tunName + " opened");
+    }
+
+    public int interfaceIndex() {
+        return interfaceIndex;
     }
 
     public byte[] readPacket() {
@@ -74,13 +79,17 @@ public class TunDevice {
                 throw new RuntimeException("WintunCreateAdapter failed, lastError=" + Native.getLastError());
             }
 
+            IntByReference indexRef = new IntByReference();
+            Wintun.INSTANCE.WintunGetAdapterLUID(adapter, indexRef);
+            interfaceIndex = indexRef.getValue();
+
             session = Wintun.INSTANCE.WintunStartSession(adapter, WINTUN_SESSION_CAPACITY);
 
             if (session == null || Pointer.nativeValue(session) == 0) {
                 throw new RuntimeException("WintunStartSession failed, lastError=" + Native.getLastError());
             }
 
-            System.out.println(tunName + " opened by wintun.dll");
+            System.out.println(tunName + " opened by wintun.dll, interface=" + interfaceIndex);
         } catch (UnsatisfiedLinkError e) {
             throw new RuntimeException("wintun.dll not found. Put wintun.dll near java.exe working directory or add it to PATH", e);
         }
@@ -147,6 +156,8 @@ public class TunDevice {
         void WintunCloseAdapter(Pointer adapter);
 
         boolean WintunDeleteAdapter(Pointer adapter, boolean forceCloseSessions);
+
+        void WintunGetAdapterLUID(Pointer adapter, IntByReference luid);
 
         Pointer WintunStartSession(Pointer adapter, int capacity);
 
