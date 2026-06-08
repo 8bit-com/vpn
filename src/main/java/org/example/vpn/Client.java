@@ -7,8 +7,6 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -20,14 +18,16 @@ public class Client {
 
     private static final String SERVER_HOST = "80.240.23.72";
     private static final int SERVER_PORT = 51888;
-    private static final int WINTUN_RING_SIZE = 0x400000;
-    private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
-    private static final int LOG_EVERY_PACKETS = 1;
-    private static final int MTU = 1200;
+
     private static final String ADAPTER_NAME = "MyVPN";
     private static final String CLIENT_IP = "10.0.0.123";
-    private static final String SERVER_TUN_IP = "10.0.0.1";
     private static final String CLIENT_MASK = "255.255.255.0";
+    private static final String SERVER_TUN_IP = "10.0.0.1";
+
+    private static final int WINTUN_RING_SIZE = 0x400000;
+    private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int MTU = 1200;
+    private static final int LOG_EVERY_PACKETS = 1;
 
     private final AtomicLong udpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToUdpCounter = new AtomicLong();
@@ -35,21 +35,13 @@ public class Client {
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
 
-        cleanupOldAdapterConfig();
-        Runtime.getRuntime().addShutdownHook(new Thread(this::cleanupOldAdapterConfig, "myvpn-cleanup"));
-
-        String defaultGateway = getDefaultGateway();
-        System.out.println("DEFAULT GATEWAY: " + defaultGateway);
+        cleanupAdapterConfig();
+        Runtime.getRuntime().addShutdownHook(new Thread(this::cleanupAdapterConfig, "myvpn-cleanup"));
 
         Pointer session = startWintun();
 
         configureMyVpnIp();
         configureMtu();
-
-        String myVpnInterfaceIndex = getMyVpnInterfaceIndex();
-        System.out.println("MYVPN INTERFACE INDEX: " + myVpnInterfaceIndex);
-
-        configureRoutes(defaultGateway, myVpnInterfaceIndex);
 
         DatagramSocket socket = createUdpSocket();
 
@@ -57,19 +49,10 @@ public class Client {
 
         startWintunToUdp(socket, session);
 
+        System.out.println("PING-ONLY MODE READY");
+        System.out.println("CHECK FROM WINDOWS: ping " + SERVER_TUN_IP);
+
         receiveUdpAndWriteToWintun(socket, session);
-    }
-
-    private DatagramSocket createUdpSocket() throws Exception {
-
-        DatagramSocket socket = new DatagramSocket();
-
-        socket.setReceiveBufferSize(UDP_BUFFER_SIZE);
-        socket.setSendBufferSize(UDP_BUFFER_SIZE);
-
-        System.out.println("UDP SOCKET READY");
-
-        return socket;
     }
 
     private Pointer startWintun() {
@@ -91,30 +74,23 @@ public class Client {
         return session;
     }
 
-    private void cleanupOldAdapterConfig() {
+    private DatagramSocket createUdpSocket() throws Exception {
 
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "0.0.0.0", SERVER_TUN_IP);
-        runCommandIgnoreError("route", "-p", "delete", "0.0.0.0", "mask", "0.0.0.0", SERVER_TUN_IP);
+        DatagramSocket socket = new DatagramSocket();
 
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
-        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", CLIENT_IP);
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
-        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", "0.0.0.0");
-        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0", SERVER_TUN_IP);
-        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0", SERVER_TUN_IP);
-        runCommandIgnoreError("route", "delete", SERVER_HOST);
-        runCommandIgnoreError("route", "delete", SERVER_TUN_IP);
+        socket.setReceiveBufferSize(UDP_BUFFER_SIZE);
+        socket.setSendBufferSize(UDP_BUFFER_SIZE);
 
-        runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
+        System.out.println("UDP SOCKET READY");
 
-        System.out.println("MYVPN CLEANUP DONE");
+        return socket;
     }
 
     private void configureMyVpnIp() throws Exception {
 
         runCommand("netsh", "interface", "ip", "set", "address", "name=" + ADAPTER_NAME, "static", CLIENT_IP, CLIENT_MASK);
 
-        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/24 without gateway");
+        System.out.println("MYVPN IP CONFIGURED: " + CLIENT_IP + "/24");
     }
 
     private void configureMtu() throws Exception {
@@ -124,62 +100,17 @@ public class Client {
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
-    private void configureRoutes(String defaultGateway, String myVpnInterfaceIndex) throws Exception {
+    private void cleanupAdapterConfig() {
 
-        runCommand("route", "add", SERVER_HOST, "mask", "255.255.255.255", defaultGateway, "metric", "1");
-        runCommand("route", "add", SERVER_TUN_IP, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", myVpnInterfaceIndex);
-        runCommand("route", "add", "0.0.0.0", "mask", "128.0.0.0", SERVER_TUN_IP, "metric", "1", "if", myVpnInterfaceIndex);
-        runCommand("route", "add", "128.0.0.0", "mask", "128.0.0.0", SERVER_TUN_IP, "metric", "1", "if", myVpnInterfaceIndex);
+        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "0.0.0.0");
+        runCommandIgnoreError("route", "delete", "0.0.0.0", "mask", "128.0.0.0");
+        runCommandIgnoreError("route", "delete", "128.0.0.0", "mask", "128.0.0.0");
+        runCommandIgnoreError("route", "delete", SERVER_HOST);
+        runCommandIgnoreError("route", "delete", SERVER_TUN_IP);
 
-        System.out.println("MYVPN FULL TUNNEL ROUTES CONFIGURED VIA " + SERVER_TUN_IP);
-    }
+        runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
 
-    private String getDefaultGateway() throws Exception {
-
-        Process process = new ProcessBuilder(
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne '" + ADAPTER_NAME + "' } | Sort-Object RouteMetric,InterfaceMetric | Select-Object -First 1).NextHop"
-        ).redirectErrorStream(true).start();
-
-        String gateway;
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            gateway = reader.readLine();
-        }
-
-        int code = process.waitFor();
-
-        if (code != 0 || gateway == null || gateway.trim().isEmpty()) {
-            throw new RuntimeException("Cannot detect default gateway");
-        }
-
-        return gateway.trim();
-    }
-
-    private String getMyVpnInterfaceIndex() throws Exception {
-
-        Process process = new ProcessBuilder(
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
-        ).redirectErrorStream(true).start();
-
-        String interfaceIndex;
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            interfaceIndex = reader.readLine();
-        }
-
-        int code = process.waitFor();
-
-        if (code != 0 || interfaceIndex == null || interfaceIndex.trim().isEmpty()) {
-            throw new RuntimeException("Cannot detect MyVPN interface index");
-        }
-
-        return interfaceIndex.trim();
+        System.out.println("MYVPN CLEANUP DONE");
     }
 
     private void register(DatagramSocket socket) throws Exception {
@@ -188,7 +119,46 @@ public class Client {
 
         socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
 
-        System.out.println("REGISTERED");
+        System.out.println("REGISTERED TO SERVER " + SERVER_HOST + ":" + SERVER_PORT);
+    }
+
+    private void startWintunToUdp(DatagramSocket socket, Pointer session) {
+
+        Thread thread = new Thread(() -> readWintunAndSendUdp(socket, session), "wintun-to-udp");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void readWintunAndSendUdp(DatagramSocket socket, Pointer session) {
+
+        while (true) {
+
+            try {
+                IntByReference size = new IntByReference();
+
+                Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, size);
+
+                if (packet == null) {
+                    Thread.sleep(1);
+                    continue;
+                }
+
+                byte[] data = packet.getByteArray(0, size.getValue());
+
+                Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
+
+                if (!shouldSendToServer(data)) {
+                    continue;
+                }
+
+                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
+
+                logEvery(wintunToUdpCounter, "WINTUN -> UDP", data);
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     private void receiveUdpAndWriteToWintun(DatagramSocket socket, Pointer session) throws Exception {
@@ -224,74 +194,24 @@ public class Client {
         Wintun.INSTANCE.WintunSendPacket(session, packet);
     }
 
-    private void startWintunToUdp(DatagramSocket socket, Pointer session) {
-
-        Thread thread = new Thread(() -> readWintunAndSendUdp(socket, session), "wintun-to-udp");
-
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private void readWintunAndSendUdp(DatagramSocket socket, Pointer session) {
-
-        while (true) {
-
-            try {
-
-                IntByReference size = new IntByReference();
-
-                Pointer packet = Wintun.INSTANCE.WintunReceivePacket(session, size);
-
-                if (packet == null) {
-                    Thread.sleep(1);
-                    continue;
-                }
-
-                byte[] data = packet.getByteArray(0, size.getValue());
-
-                Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
-
-                if (!shouldSendToServer(data)) {
-                    continue;
-                }
-
-                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(SERVER_HOST), SERVER_PORT));
-
-                logEvery(wintunToUdpCounter, "WINTUN -> UDP", data);
-
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
     private boolean shouldSendToServer(byte[] data) {
 
         if (!isIpv4(data)) {
             return false;
         }
 
+        String src = ip(data, 12);
         String dst = ip(data, 16);
 
-        if (dst.equals(CLIENT_IP)) {
+        if (!src.equals(CLIENT_IP)) {
             return false;
         }
 
-        if (dst.equals("255.255.255.255")) {
+        if (!dst.equals(SERVER_TUN_IP)) {
             return false;
         }
 
-        if (dst.endsWith(".255")) {
-            return false;
-        }
-
-        int first = data[16] & 0xFF;
-
-        if (first >= 224) {
-            return false;
-        }
-
-        return true;
+        return isIcmp(data);
     }
 
     private boolean shouldAcceptFromServer(byte[] data) {
@@ -300,9 +220,33 @@ public class Client {
             return false;
         }
 
+        String src = ip(data, 12);
         String dst = ip(data, 16);
 
-        return dst.equals(CLIENT_IP);
+        if (!src.equals(SERVER_TUN_IP)) {
+            return false;
+        }
+
+        if (!dst.equals(CLIENT_IP)) {
+            return false;
+        }
+
+        return isIcmp(data);
+    }
+
+    private boolean isIpv4(byte[] data) {
+        return data.length >= 20 && (data[0] & 0xF0) == 0x40;
+    }
+
+    private boolean isIcmp(byte[] data) {
+        return data.length >= 20 && (data[9] & 0xFF) == 1;
+    }
+
+    private String ip(byte[] data, int offset) {
+        return (data[offset] & 0xFF) + "." +
+                (data[offset + 1] & 0xFF) + "." +
+                (data[offset + 2] & 0xFF) + "." +
+                (data[offset + 3] & 0xFF);
     }
 
     private void logEvery(AtomicLong counter, String direction, byte[] data) {
@@ -314,17 +258,6 @@ public class Client {
         }
 
         System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
-    }
-
-    private boolean isIpv4(byte[] data) {
-        return data.length >= 20 && (data[0] & 0xF0) == 0x40;
-    }
-
-    private String ip(byte[] data, int offset) {
-        return (data[offset] & 0xFF) + "." +
-                (data[offset + 1] & 0xFF) + "." +
-                (data[offset + 2] & 0xFF) + "." +
-                (data[offset + 3] & 0xFF);
     }
 
     private void runCommand(String... command) throws Exception {
