@@ -35,27 +35,27 @@ public class Client {
     private final AtomicLong tunToHttpCounter = new AtomicLong();
     private final AtomicLong httpToTunCounter = new AtomicLong();
 
-    // HTTP endpoint of the server. The client sends packets to /tx and polls packets from /rx.
+    // Адрес HTTP-сервера. Клиент отправляет пакеты в /tx и забирает ответы из /rx.
     @Value("${vpn.server.url:http://80.240.23.72:8080}")
     private String serverUrl;
 
-    // Local TUN adapter name. On Windows this must match the Wintun adapter name.
+    // Имя локального TUN-адаптера. На Windows оно должно совпадать с именем Wintun-адаптера.
     @Value("${vpn.tun.name:tun-http}")
     private String tunName;
 
-    // Local client-side VPN address. Example: 10.8.0.2/24.
+    // IP-адрес клиента внутри VPN-сети. Например: 10.8.0.2/24.
     @Value("${vpn.tun.address:10.8.0.2/24}")
     private String tunAddress;
 
-    // Server-side VPN address. Internal ping target: ping 10.8.0.1.
+    // IP-адрес сервера внутри VPN-сети. Для внутренней проверки используется ping 10.8.0.1.
     @Value("${vpn.tun.gateway:10.8.0.1}")
     private String tunGateway;
 
     @Value("${vpn.mtu:1400}")
     private int mtu;
 
-    // Comma-separated list of external routes that should go into the tunnel.
-    // Example: vpn.routes=1.1.1.1,8.8.8.8
+    // Список внешних адресов через запятую, которые надо направить в туннель.
+    // Пример: vpn.routes=1.1.1.1,8.8.8.8
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
 
@@ -72,20 +72,21 @@ public class Client {
     }
 
     /**
-     * Opens the local virtual network adapter.
+     * Открывает локальный виртуальный сетевой адаптер.
      *
-     * Windows: TunDevice uses wintun.dll.
-     * Linux:   TunDevice uses /dev/net/tun through libc.
+     * Windows: TunDevice использует wintun.dll.
+     * Linux:   TunDevice использует /dev/net/tun через libc.
      */
     private void startTunAdapter() {
         tunDevice.open(tunName);
     }
 
     /**
-     * Configures IP address, MTU and routes in the operating system.
+     * Настраивает IP-адрес, MTU и маршруты в операционной системе.
      *
-     * The Java program reads packets from the TUN adapter only after the OS routing table sends
-     * traffic into this adapter. Without these routes, ping will bypass our program completely.
+     * Java-программа сможет читать пакеты из TUN-адаптера только после того,
+     * как таблица маршрутизации ОС начнёт отправлять нужный трафик в этот адаптер.
+     * Без этих маршрутов ping вообще не попадёт в наш Java-клиент.
      */
     private void configureOperatingSystemRoutes() throws Exception {
         if (isWindows()) {
@@ -97,9 +98,9 @@ public class Client {
     }
 
     /**
-     * Linux client configuration.
+     * Настройка клиента на Linux.
      *
-     * Assigns 10.8.0.2/24 to the TUN interface and routes selected targets to that interface.
+     * Назначает адрес 10.8.0.2/24 на TUN-интерфейс и направляет выбранные адреса в этот интерфейс.
      */
     private void configureLinuxNetwork() throws Exception {
         runRequiredCommand("ip", "addr", "flush", "dev", tunName);
@@ -115,25 +116,26 @@ public class Client {
     }
 
     /**
-     * Windows client configuration.
+     * Настройка клиента на Windows.
      *
-     * Important detail:
-     * Wintun returns a LUID, but Windows route.exe needs the real interface index. Therefore we
-     * resolve the index through PowerShell Get-NetAdapter instead of using WintunGetAdapterLUID.
+     * Важная деталь:
+     * Wintun возвращает LUID, но route.exe требует настоящий Windows interface index.
+     * Поэтому индекс интерфейса берётся через PowerShell Get-NetAdapter,
+     * а не через WintunGetAdapterLUID.
      */
     private void configureWindowsNetwork() throws Exception {
         String address = tunAddressIpOnly();
         String mask = tunAddressMask();
         int ifIndex = windowsInterfaceIndex(tunName);
 
-        // Give the Wintun adapter our client-side VPN IP.
+        // Назначаем Wintun-адаптеру клиентский VPN-адрес.
         runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
         runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
 
-        // MTU is optional here. Some Windows versions reject this command depending on adapter state.
+        // MTU на Windows может не примениться в зависимости от состояния адаптера, поэтому команда необязательная.
         runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
 
-        // Route both the internal gateway and configured external targets into the Wintun adapter.
+        // Направляем в Wintun и внутренний адрес сервера, и внешние адреса из vpn.routes.
         for (String target : windowsRouteTargets()) {
             runOptionalCommand("route", "delete", target);
             runRequiredCommand("route", "add", target, "mask", "255.255.255.255", address, "if", String.valueOf(ifIndex), "metric", "1");
@@ -142,13 +144,13 @@ public class Client {
     }
 
     /**
-     * Starts two permanent loops:
+     * Запускает два постоянных цикла обмена пакетами.
      *
      * 1. tun-to-http:
-     *    reads raw IP packets from Wintun/TUN and sends them to the server with POST /tx.
+     *    читает сырые IP-пакеты из Wintun/TUN и отправляет их на сервер через POST /tx.
      *
      * 2. http-to-tun:
-     *    polls the server with GET /rx and writes returned raw IP packets back to Wintun/TUN.
+     *    опрашивает сервер через GET /rx и записывает полученные сырые IP-пакеты обратно в Wintun/TUN.
      */
     private void startPacketPumpThreads() {
         Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
@@ -159,7 +161,7 @@ public class Client {
     }
 
     /**
-     * Direction: local OS -> TUN adapter -> Java client -> HTTP POST /tx -> server.
+     * Направление: локальная ОС -> TUN-адаптер -> Java-клиент -> HTTP POST /tx -> сервер.
      */
     private void pumpTunToHttpForever() {
         while (true) {
@@ -180,7 +182,7 @@ public class Client {
     }
 
     /**
-     * Direction: server -> HTTP GET /rx -> Java client -> TUN adapter -> local OS.
+     * Направление: сервер -> HTTP GET /rx -> Java-клиент -> TUN-адаптер -> локальная ОС.
      */
     private void pumpHttpToTunForever() {
         while (true) {
@@ -236,8 +238,8 @@ public class Client {
 
         HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
 
-        // 204 means that the server currently has no packet for this client.
-        // This is normal for long polling, not an error.
+        // 204 означает, что у сервера сейчас нет пакета для клиента.
+        // Для long polling это нормальная ситуация, а не ошибка.
         if (response.statusCode() == 204) {
             return null;
         }
@@ -272,7 +274,7 @@ public class Client {
     private Set<String> windowsRouteTargets() {
         Set<String> result = new LinkedHashSet<>();
 
-        // This route is required for: ping 10.8.0.1
+        // Этот маршрут нужен для проверки: ping 10.8.0.1
         result.add(tunGateway);
 
         result.addAll(Arrays.asList(externalRouteTargets()));
