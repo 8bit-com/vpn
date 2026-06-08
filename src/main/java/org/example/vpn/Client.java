@@ -20,19 +20,15 @@ import java.util.concurrent.atomic.AtomicLong;
 @Service
 public class Client {
 
-    private static final int LOG_EVERY_PACKETS = 100;
     private static final int MAX_PACKET_SIZE = 65535;
     private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration HTTP_TX_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration HTTP_RX_TIMEOUT = Duration.ofSeconds(35);
     private static final long RETRY_DELAY_MS = 1000;
-    private static final String WINDOWS_ON_LINK_GATEWAY = "0.0.0.0";
 
     private final TunDevice tunDevice;
     private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(HTTP_CONNECT_TIMEOUT).build();
-    private final AtomicLong tunToHttpCounter = new AtomicLong();
-    private final AtomicLong httpToTunCounter = new AtomicLong();
-    private final AtomicLong rxCounter = new AtomicLong();
+    private final AtomicLong pingFromWindowsCounter = new AtomicLong();
 
     @Value("${vpn.server.url:http://80.240.23.72:8080}")
     private String serverUrl;
@@ -46,7 +42,7 @@ public class Client {
     private int mtu;
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
-    @Value("${vpn.synthetic-test.enabled:true}")
+    @Value("${vpn.synthetic-test.enabled:false}")
     private boolean syntheticTestEnabled;
 
     public Client(TunDevice tunDevice) {
@@ -58,66 +54,26 @@ public class Client {
         if (syntheticTestEnabled) {
             runSyntheticIcmpHttpTest();
         }
-        startTunAdapter();
+        tunDevice.open(tunName);
         configureOperatingSystemRoutes();
         Runtime.getRuntime().addShutdownHook(new Thread(this::cleanupWindowsRoutes));
         startPacketPumpThreads();
-        printReadyMessage();
+        System.out.println("HTTP VPN CLIENT READY");
+        System.out.println("NOW CHECK ONLY THIS: ping " + tunGateway);
     }
 
     private void runSyntheticIcmpHttpTest() throws Exception {
         byte[] request = buildSyntheticIcmpEchoRequest(tunAddressIpOnly(), tunGateway);
-        System.out.println("SYNTHETIC TX " + request.length + " bytes " + PacketInfo.info(request));
         postPacketToServer(request);
         long deadline = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < deadline) {
             byte[] reply = pollPacketFromServer();
-            if (reply == null) {
-                continue;
-            }
-            System.out.println("SYNTHETIC RX " + reply.length + " bytes " + PacketInfo.info(reply));
-            if (isExpectedSyntheticReply(reply)) {
+            if (reply != null && isExpectedSyntheticReply(reply)) {
                 System.out.println("SYNTHETIC TEST OK");
                 return;
             }
         }
-        throw new RuntimeException("SYNTHETIC TEST FAILED: no ICMP echo reply from server over HTTP");
-    }
-
-    private boolean isExpectedSyntheticReply(byte[] packet) {
-        if (!isIpv4Packet(packet) || packet.length < 28) {
-            return false;
-        }
-        int ihl = (packet[0] & 0x0f) * 4;
-        return (packet[9] & 0xff) == 1
-                && ip(packet, 12).equals(tunGateway)
-                && ip(packet, 16).equals(tunAddressIpOnly())
-                && (packet[ihl] & 0xff) == 0;
-    }
-
-    private byte[] buildSyntheticIcmpEchoRequest(String srcIp, String dstIp) {
-        byte[] packet = new byte[60];
-        packet[0] = 0x45;
-        putU16(packet, 2, packet.length);
-        putU16(packet, 4, 1);
-        packet[8] = 64;
-        packet[9] = 1;
-        putIp(packet, 12, srcIp);
-        putIp(packet, 16, dstIp);
-        putU16(packet, 10, checksum(packet, 0, 20));
-        int icmp = 20;
-        packet[icmp] = 8;
-        putU16(packet, icmp + 4, 0x1234);
-        putU16(packet, icmp + 6, 1);
-        for (int i = icmp + 8; i < packet.length; i++) {
-            packet[i] = (byte) i;
-        }
-        putU16(packet, icmp + 2, checksum(packet, icmp, packet.length - icmp));
-        return packet;
-    }
-
-    private void startTunAdapter() {
-        tunDevice.open(tunName);
+        throw new RuntimeException("SYNTHETIC TEST FAILED");
     }
 
     private void configureOperatingSystemRoutes() throws Exception {
@@ -136,7 +92,6 @@ public class Client {
         for (String route : externalRouteTargets()) {
             String target = route.contains("/") ? route : route + "/32";
             runRequiredCommand("ip", "route", "replace", target, "dev", tunName);
-            System.out.println("ROUTE " + target + " -> " + tunName);
         }
     }
 
@@ -151,13 +106,11 @@ public class Client {
         for (String target : windowsRouteTargets()) {
             addWindowsRoute(target);
         }
-        printWindowsNetworkDiagnostics();
     }
 
     private void addWindowsRoute(String target) throws Exception {
         String command = "New-NetRoute -DestinationPrefix '" + target + "/32' -InterfaceAlias '" + psEscape(tunName) + "' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore";
         runRequiredCommand("powershell", "-NoProfile", "-Command", command);
-        System.out.println("ROUTE " + target + " -> New-NetRoute on-link " + tunName);
     }
 
     private void cleanupWindowsRoutes() {
@@ -166,25 +119,16 @@ public class Client {
         }
         for (String target : windowsRouteTargets()) {
             String command = "Get-NetRoute -DestinationPrefix '" + target + "/32' -ErrorAction SilentlyContinue | "
-                    + "Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' -or $_.NextHop -eq '0.0.0.0' } | "
+                    + "Where-Object { $_.InterfaceAlias -eq '" + psEscape(tunName) + "' } | "
                     + "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
             runOptionalCommand("powershell", "-NoProfile", "-Command", command);
             runOptionalCommand("route", "delete", target);
         }
     }
 
-    private void printWindowsNetworkDiagnostics() {
-        runAndPrint("WINDOWS ADAPTER", "powershell", "-NoProfile", "-Command", "Get-NetAdapter -Name '" + psEscape(tunName) + "' | Format-List ifIndex,Name,InterfaceDescription,Status");
-        runAndPrint("WINDOWS IP CONFIG", "powershell", "-NoProfile", "-Command", "Get-NetIPConfiguration -InterfaceAlias '" + psEscape(tunName) + "' | Format-List");
-        runAndPrint("WINDOWS ROUTE", "powershell", "-NoProfile", "-Command", "Get-NetRoute -DestinationPrefix " + tunGateway + "/32 | Format-List ifIndex,InterfaceAlias,DestinationPrefix,NextHop,RouteMetric,InterfaceMetric");
-        runAndPrint("WINDOWS ROUTE CHOICE", "powershell", "-NoProfile", "-Command", "Find-NetRoute -RemoteIPAddress " + tunGateway + " | Format-List ifIndex,InterfaceAlias,IPAddress,NextHop,RouteMetric");
-    }
-
     private void startPacketPumpThreads() {
-        Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
-        rxThread.start();
-        Thread txThread = new Thread(this::pumpTunToHttpForever, "tun-to-http");
-        txThread.start();
+        new Thread(this::pumpHttpToTunForever, "http-to-tun").start();
+        new Thread(this::pumpTunToHttpForever, "tun-to-http").start();
     }
 
     private void pumpTunToHttpForever() {
@@ -194,10 +138,9 @@ public class Client {
                 if (packet == null) {
                     continue;
                 }
+                logOnlyWindowsPingRequest(packet);
                 postPacketToServer(packet);
-                logEvery(tunToHttpCounter, "tun -> http", packet);
             } catch (Exception e) {
-                System.out.println("tun -> http retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 sleepBeforeRetry();
             }
         }
@@ -207,19 +150,11 @@ public class Client {
         while (true) {
             try {
                 byte[] packet = pollPacketFromServer();
-                if (packet == null) {
-                    continue;
-                }
-                long value = rxCounter.incrementAndGet();
-                System.out.println("HTTP RX CLIENT #" + value + " " + packet.length + " bytes " + PacketInfo.info(packet));
-                if (!isIpv4Packet(packet)) {
-                    System.out.println("DROP RX: not IPv4 " + packet.length + " bytes");
+                if (packet == null || !isIpv4Packet(packet)) {
                     continue;
                 }
                 tunDevice.writePacket(packet);
-                logEvery(httpToTunCounter, "http -> tun", packet);
             } catch (Exception e) {
-                System.out.println("http -> tun retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
                 sleepBeforeRetry();
             }
         }
@@ -227,14 +162,28 @@ public class Client {
 
     private byte[] readPacketFromTun() {
         byte[] packet = tunDevice.readPacket();
-        if (packet == null || packet.length == 0) {
-            return null;
-        }
-        if (packet.length > MAX_PACKET_SIZE) {
-            System.out.println("DROP TUN PACKET: too large " + packet.length + " bytes");
+        if (packet == null || packet.length == 0 || packet.length > MAX_PACKET_SIZE) {
             return null;
         }
         return packet;
+    }
+
+    private void logOnlyWindowsPingRequest(byte[] packet) {
+        if (!isIpv4Packet(packet)) {
+            return;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        if (packet.length < ihl + 8) {
+            return;
+        }
+        int protocol = packet[9] & 0xff;
+        int icmpType = packet[ihl] & 0xff;
+        String src = ip(packet, 12);
+        String dst = ip(packet, 16);
+        if (protocol == 1 && icmpType == 8 && dst.equals(tunGateway)) {
+            long count = pingFromWindowsCounter.incrementAndGet();
+            System.out.println("WINDOWS PING SEEN #" + count + " " + src + " -> " + dst);
+        }
     }
 
     private void postPacketToServer(byte[] packet) throws Exception {
@@ -256,6 +205,35 @@ public class Client {
         }
         byte[] packet = response.body();
         return packet.length == 0 ? null : packet;
+    }
+
+    private boolean isExpectedSyntheticReply(byte[] packet) {
+        if (!isIpv4Packet(packet) || packet.length < 28) {
+            return false;
+        }
+        int ihl = (packet[0] & 0x0f) * 4;
+        return (packet[9] & 0xff) == 1 && ip(packet, 12).equals(tunGateway) && ip(packet, 16).equals(tunAddressIpOnly()) && (packet[ihl] & 0xff) == 0;
+    }
+
+    private byte[] buildSyntheticIcmpEchoRequest(String srcIp, String dstIp) {
+        byte[] packet = new byte[60];
+        packet[0] = 0x45;
+        putU16(packet, 2, packet.length);
+        putU16(packet, 4, 1);
+        packet[8] = 64;
+        packet[9] = 1;
+        putIp(packet, 12, srcIp);
+        putIp(packet, 16, dstIp);
+        putU16(packet, 10, checksum(packet, 0, 20));
+        int icmp = 20;
+        packet[icmp] = 8;
+        putU16(packet, icmp + 4, 0x1234);
+        putU16(packet, icmp + 6, 1);
+        for (int i = icmp + 8; i < packet.length; i++) {
+            packet[i] = (byte) i;
+        }
+        putU16(packet, icmp + 2, checksum(packet, icmp, packet.length - icmp));
+        return packet;
     }
 
     private boolean isIpv4Packet(byte[] packet) {
@@ -324,22 +302,6 @@ public class Client {
         return ((mask >>> 24) & 0xff) + "." + ((mask >>> 16) & 0xff) + "." + ((mask >>> 8) & 0xff) + "." + (mask & 0xff);
     }
 
-    private void logEvery(AtomicLong counter, String direction, byte[] data) {
-        long value = counter.incrementAndGet();
-        if (value % LOG_EVERY_PACKETS != 0) {
-            return;
-        }
-        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
-    }
-
-    private void printReadyMessage() {
-        System.out.println("HTTP VPN CLIENT READY");
-        System.out.println("CHECK INTERNAL: ping " + tunGateway);
-        for (String route : externalRouteTargets()) {
-            System.out.println("CHECK EXTERNAL: ping " + route);
-        }
-    }
-
     private void runRequiredCommand(String... command) throws Exception {
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         int code = process.waitFor();
@@ -353,22 +315,6 @@ public class Client {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
         } catch (Exception ignored) {
-        }
-    }
-
-    private void runAndPrint(String title, String... command) {
-        System.out.println("===== " + title + " =====");
-        try {
-            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    System.out.println(line);
-                }
-            }
-            process.waitFor();
-        } catch (Exception e) {
-            System.out.println("DIAG FAILED: " + e.getMessage());
         }
     }
 
