@@ -8,12 +8,10 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.InputStreamReader;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.util.Arrays;
+import java.net.Socket;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -36,16 +34,14 @@ public class Client {
     );
 
     private static final int WINTUN_RING_SIZE = 0x400000;
-    private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
     private static final int MTU = 1200;
     private static final int LOG_EVERY_PACKETS = 1;
+    private static final int MAX_PACKET_SIZE = 65535;
 
-    private final AtomicLong udpToWintunCounter = new AtomicLong();
-    private final AtomicLong wintunToUdpCounter = new AtomicLong();
+    private final AtomicLong tcpToWintunCounter = new AtomicLong();
+    private final AtomicLong wintunToTcpCounter = new AtomicLong();
     private final AtomicLong wintunRawCounter = new AtomicLong();
     private final AtomicLong wintunDropCounter = new AtomicLong();
-    private final AtomicLong udpRawCounter = new AtomicLong();
-    private final AtomicLong udpDropCounter = new AtomicLong();
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
@@ -59,10 +55,11 @@ public class Client {
         configureMtu();
         configureTestRoutes();
 
-        DatagramSocket socket = createConnectedUdpSocket();
+        Socket socket = createTcpSocket();
+        DataInputStream in = new DataInputStream(socket.getInputStream());
+        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
 
-        startHeartbeat(socket);
-        startWintunToUdp(socket, session);
+        startWintunToTcp(out, session);
 
         System.out.println("TEST ROUTES MODE READY");
         System.out.println("CHECK INTERNAL: ping " + SERVER_TUN_IP);
@@ -71,7 +68,7 @@ public class Client {
         }
         System.out.println("CHECK CURL: curl http://93.184.216.34");
 
-        receiveUdpAndWriteToWintun(socket, session);
+        receiveTcpAndWriteToWintun(in, session);
     }
 
     private Pointer startWintun() {
@@ -93,15 +90,13 @@ public class Client {
         return session;
     }
 
-    private DatagramSocket createConnectedUdpSocket() throws Exception {
+    private Socket createTcpSocket() throws Exception {
 
-        DatagramSocket socket = new DatagramSocket();
+        Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
+        socket.setTcpNoDelay(true);
+        socket.setKeepAlive(true);
 
-        socket.setReceiveBufferSize(UDP_BUFFER_SIZE);
-        socket.setSendBufferSize(UDP_BUFFER_SIZE);
-        socket.connect(new InetSocketAddress(InetAddress.getByName(SERVER_HOST), SERVER_PORT));
-
-        System.out.println("UDP SOCKET CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
+        System.out.println("TCP SOCKET CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
 
         return socket;
     }
@@ -166,37 +161,14 @@ public class Client {
         System.out.println("MYVPN CLEANUP DONE");
     }
 
-    private void startHeartbeat(DatagramSocket socket) {
+    private void startWintunToTcp(DataOutputStream out, Pointer session) {
 
-        Thread thread = new Thread(() -> {
-            while (true) {
-                try {
-                    sendHello(socket);
-                    Thread.sleep(1000);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        }, "udp-heartbeat");
-
+        Thread thread = new Thread(() -> readWintunAndSendTcp(out, session), "wintun-to-tcp");
         thread.setDaemon(true);
         thread.start();
     }
 
-    private void sendHello(DatagramSocket socket) throws Exception {
-
-        byte[] data = "HELLO".getBytes();
-        socket.send(new DatagramPacket(data, data.length));
-    }
-
-    private void startWintunToUdp(DatagramSocket socket, Pointer session) {
-
-        Thread thread = new Thread(() -> readWintunAndSendUdp(socket, session), "wintun-to-udp");
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private void readWintunAndSendUdp(DatagramSocket socket, Pointer session) {
+    private void readWintunAndSendTcp(DataOutputStream out, Pointer session) {
 
         while (true) {
 
@@ -221,9 +193,13 @@ public class Client {
                     continue;
                 }
 
-                socket.send(new DatagramPacket(data, data.length));
+                synchronized (out) {
+                    out.writeInt(data.length);
+                    out.write(data);
+                    out.flush();
+                }
 
-                logEvery(wintunToUdpCounter, "WINTUN -> UDP", data);
+                logEvery(wintunToTcpCounter, "WINTUN -> TCP", data);
 
             } catch (Exception e) {
                 e.printStackTrace();
@@ -231,30 +207,30 @@ public class Client {
         }
     }
 
-    private void receiveUdpAndWriteToWintun(DatagramSocket socket, Pointer session) {
+    private void receiveTcpAndWriteToWintun(DataInputStream in, Pointer session) {
 
         while (true) {
 
             try {
-                DatagramPacket udpPacket = new DatagramPacket(new byte[65535], 65535);
+                int len = in.readInt();
 
-                socket.receive(udpPacket);
+                if (len <= 0 || len > MAX_PACKET_SIZE) {
+                    throw new RuntimeException("bad tcp frame length: " + len);
+                }
 
-                byte[] data = Arrays.copyOf(udpPacket.getData(), udpPacket.getLength());
+                byte[] data = in.readNBytes(len);
 
-                logEvery(udpRawCounter, "UDP RAW", data);
-
-                if (!shouldAcceptFromServer(data)) {
-                    logEvery(udpDropCounter, "UDP DROP", data);
-                    continue;
+                if (data.length != len) {
+                    throw new RuntimeException("tcp frame truncated: " + data.length + "/" + len);
                 }
 
                 writeToWintun(session, data);
 
-                logEvery(udpToWintunCounter, "UDP -> WINTUN", data);
+                logEvery(tcpToWintunCounter, "TCP -> WINTUN", data);
 
             } catch (Exception e) {
                 e.printStackTrace();
+                sleep(1000);
             }
         }
     }
@@ -290,26 +266,6 @@ public class Client {
         }
 
         return TEST_EXTERNAL_IPS.contains(dst);
-    }
-
-    private boolean shouldAcceptFromServer(byte[] data) {
-
-        if (!isIpv4(data)) {
-            return false;
-        }
-
-        String src = ip(data, 12);
-        String dst = ip(data, 16);
-
-        if (!dst.equals(CLIENT_IP)) {
-            return false;
-        }
-
-        if (src.equals(SERVER_TUN_IP)) {
-            return true;
-        }
-
-        return TEST_EXTERNAL_IPS.contains(src);
     }
 
     private boolean isIpv4(byte[] data) {
@@ -351,6 +307,14 @@ public class Client {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
         } catch (Exception ignored) {
+        }
+    }
+
+    private void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 }
