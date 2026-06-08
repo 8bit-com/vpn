@@ -7,6 +7,8 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -23,6 +25,7 @@ public class Client {
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String CLIENT_MASK = "255.255.255.0";
     private static final String SERVER_TUN_IP = "10.0.0.1";
+    private static final String TEST_EXTERNAL_IP = "1.1.1.1";
 
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
@@ -42,6 +45,7 @@ public class Client {
 
         configureMyVpnIp();
         configureMtu();
+        configureTestRoute();
 
         DatagramSocket socket = createUdpSocket();
 
@@ -50,7 +54,8 @@ public class Client {
         startWintunToUdp(socket, session);
 
         System.out.println("PING-ONLY MODE READY");
-        System.out.println("CHECK FROM WINDOWS: ping " + SERVER_TUN_IP);
+        System.out.println("CHECK INTERNAL: ping " + SERVER_TUN_IP);
+        System.out.println("CHECK EXTERNAL: ping " + TEST_EXTERNAL_IP);
 
         receiveUdpAndWriteToWintun(socket, session);
     }
@@ -100,11 +105,43 @@ public class Client {
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
+    private void configureTestRoute() throws Exception {
+
+        String interfaceIndex = getMyVpnInterfaceIndex();
+
+        runCommandIgnoreError("route", "delete", TEST_EXTERNAL_IP);
+        runCommand("route", "add", TEST_EXTERNAL_IP, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", interfaceIndex);
+
+        System.out.println("MYVPN TEST ROUTE CONFIGURED: " + TEST_EXTERNAL_IP + " ON-LINK IF " + interfaceIndex);
+    }
+
+    private String getMyVpnInterfaceIndex() throws Exception {
+
+        Process process = new ProcessBuilder(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-NetIPAddress -IPAddress '" + CLIENT_IP + "' -AddressFamily IPv4 -ErrorAction Stop).InterfaceIndex"
+        ).redirectErrorStream(true).start();
+
+        String interfaceIndex;
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            interfaceIndex = reader.readLine();
+        }
+
+        int code = process.waitFor();
+
+        if (code != 0 || interfaceIndex == null || interfaceIndex.trim().isEmpty()) {
+            throw new RuntimeException("Cannot detect MyVPN interface index");
+        }
+
+        return interfaceIndex.trim();
+    }
+
     private void cleanupAdapterConfig() {
 
-        // Do NOT delete generic default routes here.
-        // Wide commands like "route delete 0.0.0.0 mask 0.0.0.0" can remove the real Windows/Amnezia default route.
-        // Ping-only mode does not create routes, so cleanup must only remove our own adapter IP.
+        runCommandIgnoreError("route", "delete", TEST_EXTERNAL_IP);
         runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
 
         System.out.println("MYVPN CLEANUP DONE");
@@ -204,7 +241,7 @@ public class Client {
             return false;
         }
 
-        if (!dst.equals(SERVER_TUN_IP)) {
+        if (!dst.equals(SERVER_TUN_IP) && !dst.equals(TEST_EXTERNAL_IP)) {
             return false;
         }
 
@@ -220,7 +257,7 @@ public class Client {
         String src = ip(data, 12);
         String dst = ip(data, 16);
 
-        if (!src.equals(SERVER_TUN_IP)) {
+        if (!src.equals(SERVER_TUN_IP) && !src.equals(TEST_EXTERNAL_IP)) {
             return false;
         }
 
