@@ -22,30 +22,40 @@ public class Client {
 
     private static final int LOG_EVERY_PACKETS = 100;
     private static final int MAX_PACKET_SIZE = 65535;
+    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration HTTP_TX_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration HTTP_RX_TIMEOUT = Duration.ofSeconds(35);
+    private static final long RETRY_DELAY_MS = 1000;
 
     private final TunDevice tunDevice;
     private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
+            .connectTimeout(HTTP_CONNECT_TIMEOUT)
             .build();
 
     private final AtomicLong tunToHttpCounter = new AtomicLong();
     private final AtomicLong httpToTunCounter = new AtomicLong();
 
+    // HTTP endpoint of the server. The client sends packets to /tx and polls packets from /rx.
     @Value("${vpn.server.url:http://80.240.23.72:8080}")
     private String serverUrl;
 
+    // Local TUN adapter name. On Windows this must match the Wintun adapter name.
     @Value("${vpn.tun.name:tun-http}")
     private String tunName;
 
+    // Local client-side VPN address. Example: 10.8.0.2/24.
     @Value("${vpn.tun.address:10.8.0.2/24}")
     private String tunAddress;
 
+    // Server-side VPN address. Internal ping target: ping 10.8.0.1.
     @Value("${vpn.tun.gateway:10.8.0.1}")
     private String tunGateway;
 
     @Value("${vpn.mtu:1400}")
     private int mtu;
 
+    // Comma-separated list of external routes that should go into the tunnel.
+    // Example: vpn.routes=1.1.1.1,8.8.8.8
     @Value("${vpn.routes:1.1.1.1}")
     private String routes;
 
@@ -55,58 +65,189 @@ public class Client {
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
-
-        tunDevice.open(tunName);
-        configureNetwork();
-
-        Thread rxThread = new Thread(this::readHttpAndWriteTun, "http-to-tun");
-        rxThread.start();
-
-        Thread txThread = new Thread(this::readTunAndPostHttp, "tun-to-http");
-        txThread.start();
-
-        System.out.println("HTTP VPN CLIENT READY");
-        System.out.println("CHECK INTERNAL: ping " + tunGateway);
-        for (String route : routeList()) {
-            System.out.println("CHECK EXTERNAL: ping " + route);
-        }
+        startTunAdapter();
+        configureOperatingSystemRoutes();
+        startPacketPumpThreads();
+        printReadyMessage();
     }
 
-    private void configureNetwork() throws Exception {
+    /**
+     * Opens the local virtual network adapter.
+     *
+     * Windows: TunDevice uses wintun.dll.
+     * Linux:   TunDevice uses /dev/net/tun through libc.
+     */
+    private void startTunAdapter() {
+        tunDevice.open(tunName);
+    }
+
+    /**
+     * Configures IP address, MTU and routes in the operating system.
+     *
+     * The Java program reads packets from the TUN adapter only after the OS routing table sends
+     * traffic into this adapter. Without these routes, ping will bypass our program completely.
+     */
+    private void configureOperatingSystemRoutes() throws Exception {
         if (isWindows()) {
             configureWindowsNetwork();
-        } else {
-            configureLinuxNetwork();
+            return;
         }
+
+        configureLinuxNetwork();
     }
 
+    /**
+     * Linux client configuration.
+     *
+     * Assigns 10.8.0.2/24 to the TUN interface and routes selected targets to that interface.
+     */
     private void configureLinuxNetwork() throws Exception {
-        runCommand("ip", "addr", "flush", "dev", tunName);
-        runCommand("ip", "addr", "add", tunAddress, "dev", tunName);
-        runCommand("ip", "link", "set", "dev", tunName, "mtu", String.valueOf(mtu));
-        runCommand("ip", "link", "set", tunName, "up");
+        runRequiredCommand("ip", "addr", "flush", "dev", tunName);
+        runRequiredCommand("ip", "addr", "add", tunAddress, "dev", tunName);
+        runRequiredCommand("ip", "link", "set", "dev", tunName, "mtu", String.valueOf(mtu));
+        runRequiredCommand("ip", "link", "set", tunName, "up");
 
-        for (String route : routeList()) {
+        for (String route : externalRouteTargets()) {
             String target = route.contains("/") ? route : route + "/32";
-            runCommand("ip", "route", "replace", target, "dev", tunName);
+            runRequiredCommand("ip", "route", "replace", target, "dev", tunName);
             System.out.println("ROUTE " + target + " -> " + tunName);
         }
     }
 
+    /**
+     * Windows client configuration.
+     *
+     * Important detail:
+     * Wintun returns a LUID, but Windows route.exe needs the real interface index. Therefore we
+     * resolve the index through PowerShell Get-NetAdapter instead of using WintunGetAdapterLUID.
+     */
     private void configureWindowsNetwork() throws Exception {
-        String address = tunAddress.contains("/") ? tunAddress.substring(0, tunAddress.indexOf('/')) : tunAddress;
-        String mask = prefixToMask(tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24);
+        String address = tunAddressIpOnly();
+        String mask = tunAddressMask();
         int ifIndex = windowsInterfaceIndex(tunName);
 
-        runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
-        runCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
-        runCommandIgnoreError("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
+        // Give the Wintun adapter our client-side VPN IP.
+        runOptionalCommand("netsh", "interface", "ip", "delete", "address", "name=" + tunName, "addr=" + address);
+        runRequiredCommand("netsh", "interface", "ip", "set", "address", "name=" + tunName, "static", address, mask);
 
+        // MTU is optional here. Some Windows versions reject this command depending on adapter state.
+        runOptionalCommand("netsh", "interface", "ipv4", "set", "subinterface", tunName, "mtu=" + mtu, "store=active");
+
+        // Route both the internal gateway and configured external targets into the Wintun adapter.
         for (String target : windowsRouteTargets()) {
-            runCommandIgnoreError("route", "delete", target);
-            runCommand("route", "add", target, "mask", "255.255.255.255", address, "if", String.valueOf(ifIndex), "metric", "1");
+            runOptionalCommand("route", "delete", target);
+            runRequiredCommand("route", "add", target, "mask", "255.255.255.255", address, "if", String.valueOf(ifIndex), "metric", "1");
             System.out.println("ROUTE " + target + " -> " + address + " if " + ifIndex);
         }
+    }
+
+    /**
+     * Starts two permanent loops:
+     *
+     * 1. tun-to-http:
+     *    reads raw IP packets from Wintun/TUN and sends them to the server with POST /tx.
+     *
+     * 2. http-to-tun:
+     *    polls the server with GET /rx and writes returned raw IP packets back to Wintun/TUN.
+     */
+    private void startPacketPumpThreads() {
+        Thread rxThread = new Thread(this::pumpHttpToTunForever, "http-to-tun");
+        rxThread.start();
+
+        Thread txThread = new Thread(this::pumpTunToHttpForever, "tun-to-http");
+        txThread.start();
+    }
+
+    /**
+     * Direction: local OS -> TUN adapter -> Java client -> HTTP POST /tx -> server.
+     */
+    private void pumpTunToHttpForever() {
+        while (true) {
+            try {
+                byte[] packet = readPacketFromTun();
+                if (packet == null) {
+                    continue;
+                }
+
+                postPacketToServer(packet);
+                logEvery(tunToHttpCounter, "tun -> http", packet);
+
+            } catch (Exception e) {
+                System.out.println("tun -> http retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                sleepBeforeRetry();
+            }
+        }
+    }
+
+    /**
+     * Direction: server -> HTTP GET /rx -> Java client -> TUN adapter -> local OS.
+     */
+    private void pumpHttpToTunForever() {
+        while (true) {
+            try {
+                byte[] packet = pollPacketFromServer();
+                if (packet == null) {
+                    continue;
+                }
+
+                tunDevice.writePacket(packet);
+                logEvery(httpToTunCounter, "http -> tun", packet);
+
+            } catch (Exception e) {
+                System.out.println("http -> tun retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                sleepBeforeRetry();
+            }
+        }
+    }
+
+    private byte[] readPacketFromTun() {
+        byte[] packet = tunDevice.readPacket();
+
+        if (packet == null || packet.length == 0) {
+            return null;
+        }
+
+        if (packet.length > MAX_PACKET_SIZE) {
+            System.out.println("DROP TUN PACKET: too large " + packet.length + " bytes");
+            return null;
+        }
+
+        return packet;
+    }
+
+    private void postPacketToServer(byte[] packet) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/tx"))
+                .timeout(HTTP_TX_TIMEOUT)
+                .header("Content-Type", "application/octet-stream")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(packet))
+                .build();
+
+        HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+        if (response.statusCode() != 204) {
+            throw new RuntimeException("bad /tx status " + response.statusCode());
+        }
+    }
+
+    private byte[] pollPacketFromServer() throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/rx"))
+                .timeout(HTTP_RX_TIMEOUT)
+                .GET()
+                .build();
+
+        HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+
+        // 204 means that the server currently has no packet for this client.
+        // This is normal for long polling, not an error.
+        if (response.statusCode() == 204) {
+            return null;
+        }
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("bad /rx status " + response.statusCode());
+        }
+
+        byte[] packet = response.body();
+        return packet.length == 0 ? null : packet;
     }
 
     private int windowsInterfaceIndex(String interfaceName) throws Exception {
@@ -130,86 +271,29 @@ public class Client {
 
     private Set<String> windowsRouteTargets() {
         Set<String> result = new LinkedHashSet<>();
+
+        // This route is required for: ping 10.8.0.1
         result.add(tunGateway);
-        for (String route : routeList()) {
-            result.add(route.contains("/") ? route.substring(0, route.indexOf('/')) : route);
-        }
+
+        result.addAll(Arrays.asList(externalRouteTargets()));
         return result;
     }
 
-    private void readTunAndPostHttp() {
-        while (true) {
-            try {
-                byte[] packet = tunDevice.readPacket();
-                if (packet == null || packet.length > MAX_PACKET_SIZE) {
-                    continue;
-                }
-
-                HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/tx"))
-                        .timeout(Duration.ofSeconds(10))
-                        .header("Content-Type", "application/octet-stream")
-                        .POST(HttpRequest.BodyPublishers.ofByteArray(packet))
-                        .build();
-
-                HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
-                if (response.statusCode() != 204) {
-                    throw new RuntimeException("bad /tx status " + response.statusCode());
-                }
-
-                logEvery(tunToHttpCounter, "tun -> http", packet);
-
-            } catch (Exception e) {
-                System.out.println("tun -> http retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                sleep();
-            }
-        }
-    }
-
-    private void readHttpAndWriteTun() {
-        while (true) {
-            try {
-                HttpRequest request = HttpRequest.newBuilder(URI.create(serverUrl + "/rx"))
-                        .timeout(Duration.ofSeconds(35))
-                        .GET()
-                        .build();
-
-                HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
-                if (response.statusCode() == 204) {
-                    continue;
-                }
-                if (response.statusCode() != 200) {
-                    throw new RuntimeException("bad /rx status " + response.statusCode());
-                }
-
-                byte[] packet = response.body();
-                if (packet.length > 0) {
-                    tunDevice.writePacket(packet);
-                    logEvery(httpToTunCounter, "http -> tun", packet);
-                }
-
-            } catch (Exception e) {
-                System.out.println("http -> tun retry: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                sleep();
-            }
-        }
-    }
-
-    private void logEvery(AtomicLong counter, String direction, byte[] data) {
-
-        long value = counter.incrementAndGet();
-
-        if (value % LOG_EVERY_PACKETS != 0) {
-            return;
-        }
-
-        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
-    }
-
-    private String[] routeList() {
+    private String[] externalRouteTargets() {
         return Arrays.stream(routes.split(","))
                 .map(String::trim)
                 .filter(value -> !value.isEmpty())
+                .map(value -> value.contains("/") ? value.substring(0, value.indexOf('/')) : value)
                 .toArray(String[]::new);
+    }
+
+    private String tunAddressIpOnly() {
+        return tunAddress.contains("/") ? tunAddress.substring(0, tunAddress.indexOf('/')) : tunAddress;
+    }
+
+    private String tunAddressMask() {
+        int prefix = tunAddress.contains("/") ? Integer.parseInt(tunAddress.substring(tunAddress.indexOf('/') + 1)) : 24;
+        return prefixToMask(prefix);
     }
 
     private boolean isWindows() {
@@ -221,10 +305,26 @@ public class Client {
         return ((mask >>> 24) & 0xff) + "." + ((mask >>> 16) & 0xff) + "." + ((mask >>> 8) & 0xff) + "." + (mask & 0xff);
     }
 
-    private void runCommand(String... command) throws Exception {
+    private void logEvery(AtomicLong counter, String direction, byte[] data) {
+        long value = counter.incrementAndGet();
 
+        if (value % LOG_EVERY_PACKETS != 0) {
+            return;
+        }
+
+        System.out.println(direction + " packets=" + value + " last=" + data.length + " bytes " + PacketInfo.info(data));
+    }
+
+    private void printReadyMessage() {
+        System.out.println("HTTP VPN CLIENT READY");
+        System.out.println("CHECK INTERNAL: ping " + tunGateway);
+        for (String route : externalRouteTargets()) {
+            System.out.println("CHECK EXTERNAL: ping " + route);
+        }
+    }
+
+    private void runRequiredCommand(String... command) throws Exception {
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-
         int code = process.waitFor();
 
         if (code != 0) {
@@ -232,8 +332,7 @@ public class Client {
         }
     }
 
-    private void runCommandIgnoreError(String... command) {
-
+    private void runOptionalCommand(String... command) {
         try {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
@@ -241,9 +340,9 @@ public class Client {
         }
     }
 
-    private void sleep() {
+    private void sleepBeforeRetry() {
         try {
-            Thread.sleep(1000);
+            Thread.sleep(RETRY_DELAY_MS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
