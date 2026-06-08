@@ -105,10 +105,12 @@ public class TunDevice {
 
             if (packet != null && Pointer.nativeValue(packet) != 0) {
                 int packetSize = packetSizeRef.getValue();
-                byte[] result = packet.getByteArray(0, packetSize);
+                byte[] raw = packet.getByteArray(0, packetSize);
                 Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
-                logWindowsRead(result);
-                return result;
+
+                byte[] normalized = normalizeToIpv4(raw);
+                logWindowsRead(raw, normalized);
+                return normalized != null ? normalized : raw;
             }
 
             int lastError = Native.getLastError();
@@ -119,6 +121,45 @@ public class TunDevice {
 
             throw new RuntimeException("WintunReceivePacket failed, lastError=" + lastError);
         }
+    }
+
+    private byte[] normalizeToIpv4(byte[] raw) {
+        if (isValidIpv4Packet(raw, 0)) {
+            return raw;
+        }
+
+        for (int offset = 1; offset <= Math.min(64, raw.length - 20); offset++) {
+            if (isValidIpv4Packet(raw, offset)) {
+                byte[] result = Arrays.copyOfRange(raw, offset, raw.length);
+                System.out.println("wintun normalized IPv4 offset=" + offset + " raw=" + raw.length + " normalized=" + result.length);
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    private boolean isValidIpv4Packet(byte[] data, int offset) {
+        if (data.length - offset < 20) {
+            return false;
+        }
+
+        int version = (data[offset] >> 4) & 0x0f;
+        if (version != 4) {
+            return false;
+        }
+
+        int ihl = (data[offset] & 0x0f) * 4;
+        if (ihl < 20 || data.length - offset < ihl) {
+            return false;
+        }
+
+        int totalLength = ((data[offset + 2] & 0xff) << 8) | (data[offset + 3] & 0xff);
+        if (totalLength < ihl || totalLength > data.length - offset) {
+            return false;
+        }
+
+        return true;
     }
 
     private void writeWindowsPacket(byte[] data) {
@@ -134,10 +175,14 @@ public class TunDevice {
         Wintun.INSTANCE.WintunSendPacket(session, packet);
     }
 
-    private void logWindowsRead(byte[] packet) {
+    private void logWindowsRead(byte[] raw, byte[] normalized) {
         long count = windowsReadCounter.incrementAndGet();
         if (count <= 30 || count % 100 == 0) {
-            System.out.println("wintun read #" + count + " " + packet.length + " bytes " + PacketInfo.info(packet));
+            if (normalized != null && normalized != raw) {
+                System.out.println("wintun read #" + count + " raw=" + raw.length + " normalized=" + normalized.length + " bytes " + PacketInfo.info(normalized));
+            } else {
+                System.out.println("wintun read #" + count + " " + raw.length + " bytes " + PacketInfo.info(raw));
+            }
         }
     }
 
