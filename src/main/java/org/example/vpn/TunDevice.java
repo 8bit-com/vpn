@@ -8,7 +8,6 @@ import com.sun.jna.ptr.IntByReference;
 import org.springframework.stereotype.Component;
 
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 public class TunDevice {
@@ -21,9 +20,6 @@ public class TunDevice {
     private static final int WINTUN_SESSION_CAPACITY = 0x400000;
     private static final int INFINITE = -1;
     private static final int ERROR_NO_MORE_ITEMS = 259;
-
-    private final AtomicLong windowsReadCounter = new AtomicLong();
-    private final AtomicLong windowsWriteCounter = new AtomicLong();
 
     private int fd;
     private boolean windows;
@@ -109,7 +105,6 @@ public class TunDevice {
                 Wintun.INSTANCE.WintunReleaseReceivePacket(session, packet);
 
                 byte[] normalized = normalizeToIpv4(raw);
-                logWindowsRead(raw, normalized);
                 return normalized != null ? normalized : raw;
             }
 
@@ -130,9 +125,7 @@ public class TunDevice {
 
         for (int offset = 1; offset <= Math.min(64, raw.length - 20); offset++) {
             if (isValidIpv4Packet(raw, offset)) {
-                byte[] result = Arrays.copyOfRange(raw, offset, raw.length);
-                System.out.println("wintun normalized IPv4 offset=" + offset + " raw=" + raw.length + " normalized=" + result.length);
-                return result;
+                return Arrays.copyOfRange(raw, offset, raw.length);
             }
         }
 
@@ -155,16 +148,10 @@ public class TunDevice {
         }
 
         int totalLength = ((data[offset + 2] & 0xff) << 8) | (data[offset + 3] & 0xff);
-        if (totalLength < ihl || totalLength > data.length - offset) {
-            return false;
-        }
-
-        return true;
+        return totalLength >= ihl && totalLength <= data.length - offset;
     }
 
     private void writeWindowsPacket(byte[] data) {
-        logWindowsWrite(data);
-
         Pointer packet = Wintun.INSTANCE.WintunAllocateSendPacket(session, data.length);
 
         if (packet == null || Pointer.nativeValue(packet) == 0) {
@@ -173,24 +160,6 @@ public class TunDevice {
 
         packet.write(0, data, 0, data.length);
         Wintun.INSTANCE.WintunSendPacket(session, packet);
-    }
-
-    private void logWindowsRead(byte[] raw, byte[] normalized) {
-        long count = windowsReadCounter.incrementAndGet();
-        if (count <= 30 || count % 100 == 0) {
-            if (normalized != null && normalized != raw) {
-                System.out.println("wintun read #" + count + " raw=" + raw.length + " normalized=" + normalized.length + " bytes " + PacketInfo.info(normalized));
-            } else {
-                System.out.println("wintun read #" + count + " " + raw.length + " bytes " + PacketInfo.info(raw));
-            }
-        }
-    }
-
-    private void logWindowsWrite(byte[] packet) {
-        long count = windowsWriteCounter.incrementAndGet();
-        if (count <= 30 || count % 100 == 0) {
-            System.out.println("wintun write #" + count + " " + packet.length + " bytes " + PacketInfo.info(packet));
-        }
     }
 
     private int openLinuxTun(String tunName) {
