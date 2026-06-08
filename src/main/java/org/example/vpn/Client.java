@@ -13,6 +13,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
@@ -25,7 +26,13 @@ public class Client {
     private static final String CLIENT_IP = "10.0.0.123";
     private static final String CLIENT_MASK = "255.255.255.0";
     private static final String SERVER_TUN_IP = "10.0.0.1";
-    private static final String TEST_EXTERNAL_IP = "1.1.1.1";
+
+    private static final List<String> TEST_EXTERNAL_IPS = List.of(
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "142.250.185.14"
+    );
 
     private static final int WINTUN_RING_SIZE = 0x400000;
     private static final int UDP_BUFFER_SIZE = 4 * 1024 * 1024;
@@ -45,7 +52,7 @@ public class Client {
 
         configureMyVpnIp();
         configureMtu();
-        configureTestRoute();
+        configureTestRoutes();
 
         DatagramSocket socket = createUdpSocket();
 
@@ -53,9 +60,12 @@ public class Client {
 
         startWintunToUdp(socket, session);
 
-        System.out.println("PING-ONLY MODE READY");
+        System.out.println("TEST ROUTES MODE READY");
         System.out.println("CHECK INTERNAL: ping " + SERVER_TUN_IP);
-        System.out.println("CHECK EXTERNAL: ping " + TEST_EXTERNAL_IP);
+        for (String ip : TEST_EXTERNAL_IPS) {
+            System.out.println("CHECK EXTERNAL: ping " + ip);
+        }
+        System.out.println("CHECK CURL: curl http://93.184.216.34");
 
         receiveUdpAndWriteToWintun(socket, session);
     }
@@ -105,14 +115,15 @@ public class Client {
         System.out.println("MYVPN MTU CONFIGURED: " + MTU);
     }
 
-    private void configureTestRoute() throws Exception {
+    private void configureTestRoutes() throws Exception {
 
         String interfaceIndex = getMyVpnInterfaceIndex();
 
-        runCommandIgnoreError("route", "delete", TEST_EXTERNAL_IP);
-        runCommand("route", "add", TEST_EXTERNAL_IP, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", interfaceIndex);
-
-        System.out.println("MYVPN TEST ROUTE CONFIGURED: " + TEST_EXTERNAL_IP + " ON-LINK IF " + interfaceIndex);
+        for (String ip : TEST_EXTERNAL_IPS) {
+            runCommandIgnoreError("route", "delete", ip);
+            runCommand("route", "add", ip, "mask", "255.255.255.255", "0.0.0.0", "metric", "1", "if", interfaceIndex);
+            System.out.println("MYVPN TEST ROUTE CONFIGURED: " + ip + " ON-LINK IF " + interfaceIndex);
+        }
     }
 
     private String getMyVpnInterfaceIndex() throws Exception {
@@ -141,7 +152,10 @@ public class Client {
 
     private void cleanupAdapterConfig() {
 
-        runCommandIgnoreError("route", "delete", TEST_EXTERNAL_IP);
+        for (String ip : TEST_EXTERNAL_IPS) {
+            runCommandIgnoreError("route", "delete", ip);
+        }
+
         runCommandIgnoreError("netsh", "interface", "ip", "delete", "address", "name=" + ADAPTER_NAME, "addr=" + CLIENT_IP);
 
         System.out.println("MYVPN CLEANUP DONE");
@@ -241,11 +255,11 @@ public class Client {
             return false;
         }
 
-        if (!dst.equals(SERVER_TUN_IP) && !dst.equals(TEST_EXTERNAL_IP)) {
-            return false;
+        if (dst.equals(SERVER_TUN_IP)) {
+            return true;
         }
 
-        return isIcmp(data);
+        return TEST_EXTERNAL_IPS.contains(dst);
     }
 
     private boolean shouldAcceptFromServer(byte[] data) {
@@ -257,23 +271,19 @@ public class Client {
         String src = ip(data, 12);
         String dst = ip(data, 16);
 
-        if (!src.equals(SERVER_TUN_IP) && !src.equals(TEST_EXTERNAL_IP)) {
-            return false;
-        }
-
         if (!dst.equals(CLIENT_IP)) {
             return false;
         }
 
-        return isIcmp(data);
+        if (src.equals(SERVER_TUN_IP)) {
+            return true;
+        }
+
+        return TEST_EXTERNAL_IPS.contains(src);
     }
 
     private boolean isIpv4(byte[] data) {
         return data.length >= 20 && (data[0] & 0xF0) == 0x40;
-    }
-
-    private boolean isIcmp(byte[] data) {
-        return data.length >= 20 && (data[9] & 0xFF) == 1;
     }
 
     private String ip(byte[] data, int offset) {
