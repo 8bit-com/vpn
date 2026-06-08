@@ -11,9 +11,11 @@ import java.io.BufferedReader;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Service
 public class Client {
@@ -37,11 +39,15 @@ public class Client {
     private static final int MTU = 1200;
     private static final int LOG_EVERY_PACKETS = 1;
     private static final int MAX_PACKET_SIZE = 65535;
+    private static final int CONNECT_TIMEOUT_MS = 5000;
+    private static final int RECONNECT_DELAY_MS = 3000;
 
     private final AtomicLong tcpToWintunCounter = new AtomicLong();
     private final AtomicLong wintunToTcpCounter = new AtomicLong();
     private final AtomicLong wintunRawCounter = new AtomicLong();
     private final AtomicLong wintunDropCounter = new AtomicLong();
+    private final AtomicLong tcpDropCounter = new AtomicLong();
+    private final AtomicReference<DataOutputStream> activeTcpOut = new AtomicReference<>();
 
     @EventListener(ApplicationReadyEvent.class)
     public void run() throws Exception {
@@ -55,11 +61,7 @@ public class Client {
         configureMtu();
         configureTestRoutes();
 
-        Socket socket = createTcpSocket();
-        DataInputStream in = new DataInputStream(socket.getInputStream());
-        DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-
-        startWintunToTcp(out, session);
+        startWintunToTcp(session);
 
         System.out.println("TEST ROUTES MODE READY");
         System.out.println("CHECK INTERNAL: ping " + SERVER_TUN_IP);
@@ -68,7 +70,7 @@ public class Client {
         }
         System.out.println("CHECK CURL: curl http://93.184.216.34");
 
-        receiveTcpAndWriteToWintun(in, session);
+        tcpReconnectLoop(session);
     }
 
     private Pointer startWintun() {
@@ -90,15 +92,41 @@ public class Client {
         return session;
     }
 
-    private Socket createTcpSocket() throws Exception {
+    private void tcpReconnectLoop(Pointer session) {
 
-        Socket socket = new Socket(SERVER_HOST, SERVER_PORT);
-        socket.setTcpNoDelay(true);
-        socket.setKeepAlive(true);
+        while (true) {
+            Socket socket = null;
+            DataOutputStream out = null;
 
-        System.out.println("TCP SOCKET CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
+            try {
+                System.out.println("TCP CONNECTING TO " + SERVER_HOST + ":" + SERVER_PORT);
 
-        return socket;
+                socket = new Socket();
+                socket.setTcpNoDelay(true);
+                socket.setKeepAlive(true);
+                socket.connect(new InetSocketAddress(SERVER_HOST, SERVER_PORT), CONNECT_TIMEOUT_MS);
+
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                out = new DataOutputStream(socket.getOutputStream());
+
+                activeTcpOut.set(out);
+
+                System.out.println("TCP CONNECTED TO " + SERVER_HOST + ":" + SERVER_PORT);
+
+                receiveTcpAndWriteToWintun(in, session);
+
+            } catch (Exception e) {
+                System.out.println("TCP CONNECT FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            } finally {
+                if (out != null) {
+                    activeTcpOut.compareAndSet(out, null);
+                } else {
+                    activeTcpOut.set(null);
+                }
+                closeQuietly(socket);
+                sleep(RECONNECT_DELAY_MS);
+            }
+        }
     }
 
     private void configureMyVpnIp() throws Exception {
@@ -161,14 +189,14 @@ public class Client {
         System.out.println("MYVPN CLEANUP DONE");
     }
 
-    private void startWintunToTcp(DataOutputStream out, Pointer session) {
+    private void startWintunToTcp(Pointer session) {
 
-        Thread thread = new Thread(() -> readWintunAndSendTcp(out, session), "wintun-to-tcp");
+        Thread thread = new Thread(() -> readWintunAndSendTcp(session), "wintun-to-tcp");
         thread.setDaemon(true);
         thread.start();
     }
 
-    private void readWintunAndSendTcp(DataOutputStream out, Pointer session) {
+    private void readWintunAndSendTcp(Pointer session) {
 
         while (true) {
 
@@ -193,6 +221,13 @@ public class Client {
                     continue;
                 }
 
+                DataOutputStream out = activeTcpOut.get();
+
+                if (out == null) {
+                    logEvery(tcpDropCounter, "TCP NOT CONNECTED DROP", data);
+                    continue;
+                }
+
                 synchronized (out) {
                     out.writeInt(data.length);
                     out.write(data);
@@ -202,36 +237,30 @@ public class Client {
                 logEvery(wintunToTcpCounter, "WINTUN -> TCP", data);
 
             } catch (Exception e) {
-                e.printStackTrace();
+                System.out.println("WINTUN -> TCP FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                activeTcpOut.set(null);
             }
         }
     }
 
-    private void receiveTcpAndWriteToWintun(DataInputStream in, Pointer session) {
+    private void receiveTcpAndWriteToWintun(DataInputStream in, Pointer session) throws Exception {
 
         while (true) {
+            int len = in.readInt();
 
-            try {
-                int len = in.readInt();
-
-                if (len <= 0 || len > MAX_PACKET_SIZE) {
-                    throw new RuntimeException("bad tcp frame length: " + len);
-                }
-
-                byte[] data = in.readNBytes(len);
-
-                if (data.length != len) {
-                    throw new RuntimeException("tcp frame truncated: " + data.length + "/" + len);
-                }
-
-                writeToWintun(session, data);
-
-                logEvery(tcpToWintunCounter, "TCP -> WINTUN", data);
-
-            } catch (Exception e) {
-                e.printStackTrace();
-                sleep(1000);
+            if (len <= 0 || len > MAX_PACKET_SIZE) {
+                throw new RuntimeException("bad tcp frame length: " + len);
             }
+
+            byte[] data = in.readNBytes(len);
+
+            if (data.length != len) {
+                throw new RuntimeException("tcp frame truncated: " + data.length + "/" + len);
+            }
+
+            writeToWintun(session, data);
+
+            logEvery(tcpToWintunCounter, "TCP -> WINTUN", data);
         }
     }
 
@@ -306,6 +335,17 @@ public class Client {
         try {
             Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
             process.waitFor();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+
+        try {
+            socket.close();
         } catch (Exception ignored) {
         }
     }
